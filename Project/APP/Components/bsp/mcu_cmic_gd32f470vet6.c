@@ -6,6 +6,7 @@
  * 引脚不变，写法全换了
  */
 #include "mcu_cmic_gd32f470vet6.h"
+#include "bl_partition.h"   /* BL_APP1_START_ADDR：唤醒后恢复VTOR用 */
 
 /* ---- 全局缓冲区 ---- */
 __IO uint8_t oled_cmd_buf[2]  = {0x00, 0x00};
@@ -596,4 +597,18 @@ void bsp_enter_stop_mode(void)
 
     /* 唤醒后恢复系统时钟（Stop模式会关闭HSE和PLL） */
     SystemInit();
+    SystemCoreClockUpdate();
+
+    /* ★ 关键：本工程的SystemInit()末尾会把VTOR打回BL区(0x08000000)，
+     * 必须像main.c一样重新指回APP区，否则下面开的中断会跳错向量表跑飞，
+     * 连wakeup字符串都发不出。满分的SystemInit不动VTOR故无此问题。 */
+    SCB->VTOR = BL_APP1_START_ADDR;
+
+    /* ★ Stop模式会停掉外设时钟，唤醒后必须重建串口+DMA接收链路，
+     * 否则评测J(睡眠)之后K/L/M/N全部收不到帧而超时。对齐满分实现。 */
+    systick_config();
+    bsp_usart_all_init();
+    bsp_adc_init();
+    bsp_dac_init();
+    ota_reset_state();
 }

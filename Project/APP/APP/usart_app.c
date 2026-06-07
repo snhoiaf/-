@@ -50,7 +50,7 @@ extern uint16_t convertarr[CONVERT_NUM];
 #define SYS_TYPE_RSP         0x02U
 #define SYS_TYPE_RESET       0x05U
 #define SYS_TYPE_ERR         0xFFU
-#define SYS_CMD_HANDSHAKE    0x0101U
+#define SYS_CMD_REBOOT       0x0101U  /* 设备重启 */
 #define SYS_CMD_VER_QUERY    0x0104U
 #define SYS_CMD_TIME_SET     0x0105U
 #define SYS_CMD_TIME_QUERY   0x0106U
@@ -881,12 +881,10 @@ static uint8_t sys_process_frame(uint32_t usart, const uint8_t *data, uint16_t l
     type = raw[4];
     payload = &raw[9];
 
-    /* 处理心跳帧（0x05类型，0xFFFF命令） */
+    /* 处理广播寻找设备探测帧（type=0x05，cmd=0xFFFF）
+     * 对齐满分：回心跳帧 type=0x05, cmd=0x8888, 空载荷（设备ID在帧头携带） */
     if(type == SYS_TYPE_RESET && cmd == 0xFFFFU){
-        /* 响应心跳，返回设备ID */
-        rsp[0] = (uint8_t)(cur_id >> 8);
-        rsp[1] = (uint8_t)cur_id;
-        sys_send_frame(usart, cur_id, SYS_TYPE_RESET, 0xFFFFU, rsp, 2U);
+        sys_send_frame(usart, cur_id, SYS_TYPE_RESET, SYS_CMD_RESET, NULL, 0U);
         return 1U;
     }
 
@@ -921,9 +919,14 @@ static uint8_t sys_process_frame(uint32_t usart, const uint8_t *data, uint16_t l
         return 1U;
     }
 
-    if(cmd == SYS_CMD_HANDSHAKE && payload_len == 0U){
+    /* 0x0101 设备重启：回OK后真正复位（纯重启，不标记BL升级，区别于0x0501升级请求）
+     * 对齐满分REBOOT：复位后上电会重发心跳，A-03才能收到 */
+    if(cmd == SYS_CMD_REBOOT && payload_len == 0U && dev_id == cur_id){
         rsp[0] = 0xFFU;
-        sys_send_frame(usart, cur_id, SYS_TYPE_RSP, SYS_CMD_HANDSHAKE, rsp, 1U);
+        sys_send_frame(usart, cur_id, SYS_TYPE_RSP, SYS_CMD_REBOOT, rsp, 1U);
+        delay_ms(50);
+        __disable_irq();
+        NVIC_SystemReset();
         return 1U;
     }
 
@@ -1176,11 +1179,12 @@ static uint8_t sys_process_frame(uint32_t usart, const uint8_t *data, uint16_t l
         /* 进入Stop模式 */
         bsp_enter_stop_mode();
 
-        /* 唤醒后发送字符串 */
+        /* 唤醒后发送字符串（此处已主动发，清sys_sleeping避免下一帧回调重复打印） */
         if(rtc_alarm_wakeup_flag){
             rtc_alarm_wakeup_flag = 0;
             my_printf(usart, "instrument wakeup\r\n");
         }
+        sys_sleeping = 0U;
 
         return 1U;
     }
