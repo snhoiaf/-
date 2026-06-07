@@ -567,11 +567,18 @@ void bsp_rtc_alarm_set(uint32_t seconds_later)
     /* 配置闹钟 */
     rtc_alarm_config(RTC_ALARM0, &alarm_cfg);
 
-    /* 使能闹钟中断 */
-    rtc_interrupt_enable(RTC_INT_ALARM0);
+    /* 清除EXTI17挂起位 */
     exti_interrupt_flag_clear(EXTI_17);
-    exti_init(EXTI_17, EXTI_INTERRUPT, EXTI_TRIG_RISING);
 
+    /* 配置EXTI17为中断+事件模式，上升沿触发 */
+    exti_init(EXTI_17, EXTI_INTERRUPT, EXTI_TRIG_RISING);
+    exti_event_enable(EXTI_17);  /* 事件模式用于Stop模式唤醒 */
+
+    /* 使能RTC闹钟中断 */
+    rtc_interrupt_enable(RTC_INT_ALARM0);
+    rtc_flag_clear(RTC_FLAG_ALRM0);
+
+    /* 使能NVIC中断 */
     nvic_irq_enable(RTC_Alarm_IRQn, 0, 0);
 
     /* 使能闹钟 */
@@ -586,4 +593,7 @@ void bsp_enter_stop_mode(void)
 
     /* 配置Stop模式：低功耗，电压调节器低功耗模式，正常驱动 */
     pmu_to_deepsleepmode(PMU_LDO_LOWPOWER, PMU_LOWDRIVER_DISABLE, WFI_CMD);
+
+    /* 唤醒后恢复系统时钟（Stop模式会关闭HSE和PLL） */
+    SystemInit();
 }

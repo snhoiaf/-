@@ -30,7 +30,7 @@ static void sys_init(void)
     bsp_gd25qxx_init();
     bsp_usart_all_init();
 
-    my_printf(DEBUG_USART, "\r\n=== V2 APP boot ===\r\n");
+    my_printf(DEBUG_USART, "\r\n=== V2 APP boot v2.0 OTA TEST ===\r\n");
 
     bsp_gd30ad3344_init();
     bsp_adc_init();

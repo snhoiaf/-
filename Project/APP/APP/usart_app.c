@@ -129,6 +129,25 @@ static volatile uint8_t sys_sleeping = 0;           /* 协议睡眠状态 */
 volatile uint8_t rtc_alarm_wakeup_flag = 0;         /* RTC闹钟唤醒标志 */
 static uint8_t alarm_state = 0;                     /* bit0=CH0告警, bit1=CH1告警 */
 
+/* 告警记录结构（16字节） */
+typedef struct {
+    uint32_t timestamp;   /* UTC时间戳 */
+    uint8_t  channel;     /* 0=CH0, 1=CH1 */
+    uint8_t  reserved[3]; /* 对齐 */
+    float    threshold;   /* 阈值 */
+    float    actual;      /* 实际值 */
+} alarm_record_t;
+
+#define ALARM_RECORD_MAX   64           /* 最多存储64条 */
+#define ALARM_FLASH_ADDR   0x00000000   /* 告警记录在外部Flash的起始地址 */
+#define ALARM_MODE_REPORT  0x01         /* 主动上报 */
+#define ALARM_MODE_STORE   0x02         /* 仅存储 */
+
+static uint8_t alarm_mode = ALARM_MODE_REPORT;     /* 默认主动上报 */
+static uint16_t alarm_wr_index = 0;                /* 写索引（循环） */
+static uint16_t alarm_count = 0;                   /* 当前记录数 */
+
+
 __IO uint8_t  debug_rx_flag = 0;
 __IO uint16_t debug_uart_dma_len = 0;
 uint8_t debug_uart_dma_buffer[DEBUG_UART_RXBUF_SIZE];
@@ -597,9 +616,9 @@ static bool unix_to_rtc(uint32_t utc)
 static uint32_t baud_from_code(uint8_t code)
 {
     switch(code){
-        case 0x11U: return 4800U;
-        case 0x12U: return 9600U;
-        case 0x13U: return 19200U;
+        case 0x11U: return 19200U;
+        case 0x12U: return 38400U;
+        case 0x13U: return 57600U;
         case 0x14U: return 115200U;
         default: return 0U;
     }
@@ -663,6 +682,65 @@ static uint32_t float_to_bits(float f)
     union { float f; uint32_t u; } v;
     v.f = f;
     return v.u;
+}
+
+/* 写告警记录到外部Flash */
+static void alarm_record_write(uint8_t channel, float threshold, float actual)
+{
+    alarm_record_t rec;
+    uint32_t addr;
+
+    rec.timestamp = rtc_to_unix();
+    rec.channel = channel;
+    rec.reserved[0] = rec.reserved[1] = rec.reserved[2] = 0;
+    rec.threshold = threshold;
+    rec.actual = actual;
+
+    addr = ALARM_FLASH_ADDR + (alarm_wr_index * sizeof(alarm_record_t));
+    spi_flash_buffer_write((uint8_t*)&rec, addr, sizeof(alarm_record_t));
+
+    alarm_wr_index = (alarm_wr_index + 1) % ALARM_RECORD_MAX;
+    if(alarm_count < ALARM_RECORD_MAX){
+        alarm_count++;
+    }
+}
+
+/* 读告警记录从外部Flash（倒序，最新的在前） */
+static uint16_t alarm_record_read(alarm_record_t *buf, uint16_t max_count)
+{
+    uint16_t i, actual_count, rd_index;
+    uint32_t addr;
+
+    actual_count = (alarm_count < max_count) ? alarm_count : max_count;
+    if(actual_count == 0){
+        return 0;
+    }
+
+    for(i = 0; i < actual_count; i++){
+        /* 倒序：从最新的开始读 */
+        if(alarm_wr_index == 0){
+            rd_index = ALARM_RECORD_MAX - 1 - i;
+        } else {
+            rd_index = alarm_wr_index - 1 - i;
+            if(rd_index >= ALARM_RECORD_MAX){  /* 下溢回绕 */
+                rd_index += ALARM_RECORD_MAX;
+            }
+        }
+        addr = ALARM_FLASH_ADDR + (rd_index * sizeof(alarm_record_t));
+        spi_flash_buffer_read((uint8_t*)&buf[i], addr, sizeof(alarm_record_t));
+    }
+
+    return actual_count;
+}
+
+/* 清除告警记录 */
+static void alarm_record_clear(void)
+{
+    uint8_t erase_buf[4096];
+    memset(erase_buf, 0xFF, sizeof(erase_buf));
+    spi_flash_sector_erase(ALARM_FLASH_ADDR);  /* 擦除第一个扇区 */
+    alarm_wr_index = 0;
+    alarm_count = 0;
 }
 
 static float cfg_ch0_ratio(void)
@@ -1010,6 +1088,52 @@ static uint8_t sys_process_frame(uint32_t usart, const uint8_t *data, uint16_t l
         return 1U;
     }
 
+    /* 0x0601 设置告警上报模式 */
+    if(cmd == SYS_CMD_ALARM_SET && payload_len == 1U){
+        if(payload[0] == 0x01U || payload[0] == 0x02U){
+            alarm_mode = payload[0];
+            rsp[0] = 0xFFU;
+        } else {
+            rsp[0] = 0xFEU;
+        }
+        sys_send_frame(usart, cur_id, SYS_TYPE_RSP, SYS_CMD_ALARM_SET, rsp, 1U);
+        return 1U;
+    }
+
+    /* 0x0602 查询告警记录（最近10条，倒序） */
+    if(cmd == SYS_CMD_ALARM_QUERY && payload_len == 0U){
+        alarm_record_t records[10];
+        uint16_t count, i;
+        rtc_parameter_struct rtc_time;
+        uint32_t ts;
+
+        count = alarm_record_read(records, 10);
+        if(count == 0){
+            my_printf(usart, "empty\r\n");
+        } else {
+            for(i = 0; i < count; i++){
+                /* 将时间戳转换回RTC格式显示 */
+                unix_to_rtc(records[i].timestamp);
+                rtc_current_time_get(&rtc_time);
+                my_printf(usart, "20%02x-%02x-%02x %02x:%02x:%02x | CH%d | %.2f | %.2f\r\n",
+                          rtc_time.year, rtc_time.month, rtc_time.date,
+                          rtc_time.hour, rtc_time.minute, rtc_time.second,
+                          records[i].channel,
+                          records[i].threshold,
+                          records[i].actual);
+            }
+        }
+        return 1U;
+    }
+
+    /* 0x0603 清除告警记录 */
+    if(cmd == SYS_CMD_ALARM_CLEAR && payload_len == 0U){
+        alarm_record_clear();
+        rsp[0] = 0xFFU;
+        sys_send_frame(usart, cur_id, SYS_TYPE_RSP, SYS_CMD_ALARM_CLEAR, rsp, 1U);
+        return 1U;
+    }
+
     if(cmd == SYS_CMD_DAC_SET && payload_len == 2U){
         uint16_t dac_value = get_u16_be(payload);
         ok = dac_value <= 4095U;
@@ -1036,6 +1160,9 @@ static uint8_t sys_process_frame(uint32_t usart, const uint8_t *data, uint16_t l
 
         /* 配置RTC闹钟10秒后唤醒 */
         bsp_rtc_alarm_set(10);
+
+        /* 设置睡眠标志 */
+        sys_sleeping = 1U;
 
         /* 进入Stop模式 */
         bsp_enter_stop_mode();
@@ -1142,14 +1269,36 @@ static void sampling_process(void)
         new_alarm_state |= 0x02U;
     }
 
-    if((new_alarm_state & 0x01U) != (alarm_state & 0x01U)){
-        /* 告警上报：ASCII字符串直接回复（非帧封装），I阶段完善 */
-        my_printf(USART1, "ALARM CH0 thr=%.2f val=%.2f\r\n",
-                  bits_to_float(cfg.ch0_thr_bits), ch0);
+    /* CH0告警：状态变化（新告警触发） */
+    if((new_alarm_state & 0x01U) != (alarm_state & 0x01U) && (new_alarm_state & 0x01U)){
+        float thr = bits_to_float(cfg.ch0_thr_bits);
+        alarm_record_write(0, thr, ch0);  /* 存储记录 */
+
+        if(alarm_mode == ALARM_MODE_REPORT){
+            /* 主动上报：格式化字符串 */
+            rtc_parameter_struct rtc_time;
+            rtc_current_time_get(&rtc_time);
+            my_printf(USART1, "20%02x-%02x-%02x %02x:%02x:%02x | CH0 | %.2f | %.2f\r\n",
+                      rtc_time.year, rtc_time.month, rtc_time.date,
+                      rtc_time.hour, rtc_time.minute, rtc_time.second,
+                      thr, ch0);
+        }
     }
-    if((new_alarm_state & 0x02U) != (alarm_state & 0x02U)){
-        my_printf(USART1, "ALARM CH1 thr=%.2f val=%.2f\r\n",
-                  bits_to_float(cfg.ch1_thr_bits), ch1);
+
+    /* CH1告警：状态变化（新告警触发） */
+    if((new_alarm_state & 0x02U) != (alarm_state & 0x02U) && (new_alarm_state & 0x02U)){
+        float thr = bits_to_float(cfg.ch1_thr_bits);
+        alarm_record_write(1, thr, ch1);  /* 存储记录 */
+
+        if(alarm_mode == ALARM_MODE_REPORT){
+            /* 主动上报：格式化字符串 */
+            rtc_parameter_struct rtc_time;
+            rtc_current_time_get(&rtc_time);
+            my_printf(USART1, "20%02x-%02x-%02x %02x:%02x:%02x | CH1 | %.2f | %.2f\r\n",
+                      rtc_time.year, rtc_time.month, rtc_time.date,
+                      rtc_time.hour, rtc_time.minute, rtc_time.second,
+                      thr, ch1);
+        }
     }
     alarm_state = new_alarm_state;
 
@@ -1311,7 +1460,7 @@ void debug_uart_frame_callback(const uint8_t *d, uint16_t len)
     if (sys_sleeping) {
         sys_sleeping = 0U;
         my_printf(DEBUG_USART, "instrument wakeup\r\n");
-        return;
+        /* 继续处理该帧，不要return */
     }
     if (sys_process_frame(DEBUG_USART, d, len)) {
         return;
@@ -1334,7 +1483,7 @@ void usart1_frame_callback(const uint8_t *d, uint16_t len)
     if (sys_sleeping) {
         sys_sleeping = 0U;
         my_printf(USART1, "instrument wakeup\r\n");
-        return;
+        /* 继续处理该帧，不要return */
     }
     if (sys_process_frame(USART1, d, len)) {
         return;
