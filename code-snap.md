@@ -229,18 +229,20 @@ void scheduler_run(void)      // 遍历执行到期任务
 ### 串口应用 (usart_app.c/h)
 ```c
 int  my_printf(uint32_t usart_periph, const char *format, ...)  // 格式化串口输出，RS485方向控制
-void uart_task(void)                    // 调度器任务：debug帧回调+USART1帧回调+OTA轮询+采样处理
+void uart_task(void)                    // 调度器任务：debug帧回调+USART1帧回调+OTA轮询+协议自动上报/告警处理
 void ota_reset_state(void)              // 重置OTA解析状态
-void debug_uart_frame_callback(const uint8_t *data, uint16_t len)  // Debug帧回调，解析test/conf/start/stop命令
-void usart1_frame_callback(const uint8_t *data, uint16_t len)  // USART1帧回调，解析test/conf/start/stop命令
+void debug_uart_frame_callback(const uint8_t *data, uint16_t len)  // Debug帧回调，优先解析A5B6评测协议，兼容test/conf/start/stop命令
+void usart1_frame_callback(const uint8_t *data, uint16_t len)  // USART1帧回调，优先解析A5B6评测协议，兼容test/conf/start/stop命令
+// 内部: static uint8_t sys_process_frame(...)  // 解析A5B6/B6A5 ASCII HEX帧，CRC16-Modbus低字节优先
+// 内部: static void sys_send_frame(...)  // 发送评测协议帧，支持A/B/C/J/K/L/M基础命令响应
 // 内部: static void system_selftest(void)  // 系统自检：Flash/TF卡/RTC，输出到USART1
 // 内部: static void config_manage(void)  // 配置管理：从TF卡读取config.ini，更新到Flash
-// 内部: static bool config_read(config_data_t *cfg)  // 从Flash读取配置
-// 内部: static bool config_write(const config_data_t *cfg)  // 写入配置到Flash
+// 内部: static bool config_read(config_data_t *cfg)  // 从Flash读取配置，兼容旧配置结构
+// 内部: static bool config_write(const config_data_t *cfg)  // 写入配置到Flash，持久化ID/阈值/周期/DAC/波特率
 // 内部: static bool parse_ini_value(const char *content, const char *key, uint32_t *value)  // 解析INI值
 // 内部: static void sampling_start(void)  // 启动周期采样
 // 内部: static void sampling_stop(void)  // 停止周期采样
-// 内部: static void sampling_process(void)  // 周期采样处理：LED闪烁+ADC采样+串口输出，OLED状态由oled_task统一显示
+// 内部: static void sampling_process(void)  // 周期处理：0x0302自动上报UTC+CH0+CH1，0x0411基础告警/恢复帧
 // 内部: static float adc_to_voltage(uint16_t adc_val)  // ADC值转电压
 ```
 
@@ -252,7 +254,7 @@ void led_task(void)           // 刷新LED状态数组到硬件
 
 ### ADC应用 (adc_app.c/h)
 ```c
-void adc_task(void)           // 更新convertarr[0] = adc_value[0]
+void adc_task(void)           // 保持ADC DMA采样，DAC输出由评测协议/持久化配置控制
 ```
 
 ### OLED应用 (oled_app.c/h)

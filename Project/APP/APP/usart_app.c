@@ -7,6 +7,8 @@
 #include "usart_app.h"
 #include "ota_uart.h"
 #include "rtc_app.h"
+#include "adc_app.h"
+#include "gd30ad3344.h"
 #include "bl_partition.h"
 
 extern uint8_t rxbuffer[OTA_UART_RXBUF_SIZE];
@@ -14,12 +16,17 @@ extern uint8_t debug_rxbuffer[DEBUG_UART_RXBUF_SIZE];
 extern uint8_t usart1_rxbuffer[256];
 extern rtc_parameter_struct rtc_initpara;
 extern uint16_t adc_value[2];
+extern uint16_t convertarr[CONVERT_NUM];
 
 /* 配置数据存储在DATA区域 */
 #define CONFIG_DATA_ADDR  BL_DATA_START_ADDR
 #define CONFIG_MAGIC      0x434F4E46UL  /* "CONF" */
-#define CONFIG_DEFAULT_RATIO  1UL
-#define CONFIG_DEFAULT_LIMIT  5UL
+#define CONFIG_DEFAULT_RATIO      1UL
+#define CONFIG_DEFAULT_LIMIT      5UL
+#define CONFIG_DEFAULT_THRESHOLD  2500UL
+#define CONFIG_DEFAULT_PERIOD     5UL
+#define CONFIG_DEFAULT_DAC        0UL
+#define CONFIG_DEFAULT_BAUD_CODE  0x14U
 
 #define DEVICE_ID_DEFAULT    0x0001U
 #define DEVICE_ID_MIN        0x0001U
@@ -41,9 +48,25 @@ extern uint16_t adc_value[2];
 #define SYS_TYPE_RSP         0x02U
 #define SYS_TYPE_RESET       0x05U
 #define SYS_TYPE_ERR         0xFFU
+#define SYS_CMD_HANDSHAKE    0x0101U
 #define SYS_CMD_VER_QUERY    0x0104U
+#define SYS_CMD_TIME_SET     0x0105U
+#define SYS_CMD_TIME_QUERY   0x0106U
 #define SYS_CMD_ID_QUERY     0x0111U
+#define SYS_CMD_BAUD_QUERY   0x0112U
 #define SYS_CMD_ID_SET       0x01A1U
+#define SYS_CMD_BAUD_SET     0x01A2U
+#define SYS_CMD_CH0_QUERY    0x0201U
+#define SYS_CMD_CH1_QUERY    0x0221U
+#define SYS_CMD_TEMP_OR_LIMIT 0x0241U
+#define SYS_CMD_PERIOD_SET   0x0261U
+#define SYS_CMD_DAC_SET      0x0301U
+#define SYS_CMD_AUTO_REPORT  0x0302U
+#define SYS_CMD_SLEEP        0x03AAU
+#define SYS_CMD_ALARM_REPORT 0x0411U
+#define SYS_CMD_BOOT_ENTER   0x0501U
+#define SYS_CMD_OTA_DATA     0x0502U
+#define SYS_CMD_OTA_DONE     0x0503U
 #define SYS_CMD_RESET        0x8888U
 #define SYS_CMD_ERR          0xEEEEU
 
@@ -58,11 +81,25 @@ typedef struct {
 } config_legacy_data_t;
 
 typedef struct {
-    uint32_t magic;      /* CONFIG_MAGIC */
-    uint32_t ratio;      /* 变比 */
-    uint32_t limit;      /* 阈值/采样周期 */
-    uint32_t device_id;  /* 设备ID: 0x0001~0xFFFE */
-    uint32_t crc32;      /* CRC32校验 */
+    uint32_t magic;
+    uint32_t ratio;
+    uint32_t limit;
+    uint32_t device_id;
+    uint32_t crc32;
+} config_v1_data_t;
+
+typedef struct {
+    uint32_t magic;          /* CONFIG_MAGIC */
+    uint32_t ratio;          /* 变比 */
+    uint32_t limit;          /* 兼容旧配置：阈值/采样周期 */
+    uint32_t device_id;      /* 设备ID: 0x0001~0xFFFE */
+    uint32_t ch0_limit_mv;   /* CH0阈值，单位mV */
+    uint32_t ch1_limit_mv;   /* CH1阈值，单位mV */
+    uint32_t ch0_period_sec; /* CH0采集周期，单位秒 */
+    uint32_t ch1_period_sec; /* CH1采集周期，单位秒 */
+    uint32_t dac_value;      /* DAC输出值：0~4095 */
+    uint32_t baud_code;      /* 0x11/0x12/0x13/0x14 */
+    uint32_t crc32;          /* CRC32校验 */
 } config_data_t;
 
 /* 文件系统变量 */
@@ -72,6 +109,8 @@ static FATFS config_fs;
 static volatile uint8_t sampling_active = 0;      /* 采样状态：0=停止，1=运行 */
 static volatile uint32_t sampling_cycle_ms = 5000; /* 采样周期，默认5秒 */
 static volatile uint32_t sampling_last_time = 0;   /* 上次采样时间 */
+static volatile uint8_t sys_sleeping = 0;           /* 协议睡眠状态 */
+static uint8_t alarm_state = 0;                     /* bit0=CH0告警, bit1=CH1告警 */
 
 __IO uint8_t  debug_rx_flag = 0;
 __IO uint16_t debug_uart_dma_len = 0;
@@ -176,6 +215,12 @@ static void config_default(config_data_t *cfg)
     cfg->ratio = CONFIG_DEFAULT_RATIO;
     cfg->limit = CONFIG_DEFAULT_LIMIT;
     cfg->device_id = DEVICE_ID_DEFAULT;
+    cfg->ch0_limit_mv = CONFIG_DEFAULT_THRESHOLD;
+    cfg->ch1_limit_mv = CONFIG_DEFAULT_THRESHOLD;
+    cfg->ch0_period_sec = CONFIG_DEFAULT_PERIOD;
+    cfg->ch1_period_sec = CONFIG_DEFAULT_PERIOD;
+    cfg->dac_value = CONFIG_DEFAULT_DAC;
+    cfg->baud_code = CONFIG_DEFAULT_BAUD_CODE;
 }
 
 static bool device_id_valid(uint32_t id)
@@ -186,6 +231,7 @@ static bool device_id_valid(uint32_t id)
 static bool config_read(config_data_t *cfg)
 {
     const config_data_t *flash_cfg = (const config_data_t *)CONFIG_DATA_ADDR;
+    const config_v1_data_t *v1_cfg = (const config_v1_data_t *)CONFIG_DATA_ADDR;
     const config_legacy_data_t *legacy_cfg = (const config_legacy_data_t *)CONFIG_DATA_ADDR;
     uint32_t crc;
 
@@ -196,6 +242,15 @@ static bool config_read(config_data_t *cfg)
     crc = calc_crc32((const uint8_t *)flash_cfg, offsetof(config_data_t, crc32));
     if (crc == flash_cfg->crc32 && device_id_valid(flash_cfg->device_id)) {
         *cfg = *flash_cfg;
+        return true;
+    }
+
+    crc = calc_crc32((const uint8_t *)v1_cfg, offsetof(config_v1_data_t, crc32));
+    if (crc == v1_cfg->crc32 && device_id_valid(v1_cfg->device_id)) {
+        config_default(cfg);
+        cfg->ratio = v1_cfg->ratio;
+        cfg->limit = v1_cfg->limit;
+        cfg->device_id = v1_cfg->device_id;
         return true;
     }
 
@@ -224,6 +279,24 @@ static bool config_write(const config_data_t *cfg)
     }
     if (cfg_with_crc.limit == 0U) {
         cfg_with_crc.limit = CONFIG_DEFAULT_LIMIT;
+    }
+    if (cfg_with_crc.ch0_limit_mv == 0U) {
+        cfg_with_crc.ch0_limit_mv = CONFIG_DEFAULT_THRESHOLD;
+    }
+    if (cfg_with_crc.ch1_limit_mv == 0U) {
+        cfg_with_crc.ch1_limit_mv = CONFIG_DEFAULT_THRESHOLD;
+    }
+    if (cfg_with_crc.ch0_period_sec == 0U) {
+        cfg_with_crc.ch0_period_sec = CONFIG_DEFAULT_PERIOD;
+    }
+    if (cfg_with_crc.ch1_period_sec == 0U) {
+        cfg_with_crc.ch1_period_sec = CONFIG_DEFAULT_PERIOD;
+    }
+    if (cfg_with_crc.baud_code == 0U) {
+        cfg_with_crc.baud_code = CONFIG_DEFAULT_BAUD_CODE;
+    }
+    if (cfg_with_crc.dac_value > 4095U) {
+        cfg_with_crc.dac_value = 4095U;
     }
     cfg_with_crc.crc32 = calc_crc32((const uint8_t *)&cfg_with_crc, offsetof(config_data_t, crc32));
 
@@ -395,11 +468,195 @@ static bool sys_device_id_set(uint16_t id)
     return config_write(&cfg);
 }
 
+static void config_read_or_default(config_data_t *cfg)
+{
+    if(!config_read(cfg)){
+        config_default(cfg);
+    }
+}
+
+static uint8_t dec_to_bcd(uint8_t dec)
+{
+    return (uint8_t)(((dec / 10U) << 4) | (dec % 10U));
+}
+
+static uint8_t is_leap_year(uint16_t year)
+{
+    return ((year % 4U) == 0U && (year % 100U) != 0U) || ((year % 400U) == 0U);
+}
+
+static uint8_t month_days(uint16_t year, uint8_t month)
+{
+    static const uint8_t days[] = {31U,28U,31U,30U,31U,30U,31U,31U,30U,31U,30U,31U};
+    if(month == 2U && is_leap_year(year)) return 29U;
+    return days[month - 1U];
+}
+
+static uint32_t rtc_to_unix(void)
+{
+    rtc_parameter_struct t;
+    uint16_t year;
+    uint8_t month;
+    uint32_t days = 0U;
+    uint16_t y;
+    uint8_t m;
+
+    rtc_current_time_get(&t);
+    year = (uint16_t)(2000U + bcd_to_dec(t.year));
+    month = bcd_to_dec(t.month);
+
+    for(y = 1970U; y < year; y++){
+        days += is_leap_year(y) ? 366U : 365U;
+    }
+    for(m = 1U; m < month; m++){
+        days += month_days(year, m);
+    }
+    days += (uint32_t)(bcd_to_dec(t.date) - 1U);
+
+    return days * 86400U +
+           (uint32_t)bcd_to_dec(t.hour) * 3600U +
+           (uint32_t)bcd_to_dec(t.minute) * 60U +
+           (uint32_t)bcd_to_dec(t.second);
+}
+
+static bool unix_to_rtc(uint32_t utc)
+{
+    rtc_parameter_struct t;
+    uint32_t days = utc / 86400U;
+    uint32_t rem = utc % 86400U;
+    uint16_t year = 1970U;
+    uint8_t month = 1U;
+    uint8_t dow;
+
+    while(days >= (uint32_t)(is_leap_year(year) ? 366U : 365U)){
+        days -= is_leap_year(year) ? 366U : 365U;
+        year++;
+    }
+    while(days >= month_days(year, month)){
+        days -= month_days(year, month);
+        month++;
+    }
+
+    dow = (uint8_t)(((utc / 86400U) + 4U) % 7U);
+    if(dow == 0U) dow = RTC_SUNDAY;
+
+    memset(&t, 0, sizeof(t));
+    t.factor_asyn = 0x7F;
+    t.factor_syn = 0xFF;
+    t.year = dec_to_bcd((uint8_t)(year % 100U));
+    t.month = dec_to_bcd(month);
+    t.date = dec_to_bcd((uint8_t)(days + 1U));
+    t.day_of_week = dow;
+    t.display_format = RTC_24HOUR;
+    t.am_pm = RTC_AM;
+    t.hour = dec_to_bcd((uint8_t)(rem / 3600U));
+    rem %= 3600U;
+    t.minute = dec_to_bcd((uint8_t)(rem / 60U));
+    t.second = dec_to_bcd((uint8_t)(rem % 60U));
+
+    return rtc_init(&t) == SUCCESS;
+}
+
+static uint32_t baud_from_code(uint8_t code)
+{
+    switch(code){
+        case 0x11U: return 4800U;
+        case 0x12U: return 9600U;
+        case 0x13U: return 19200U;
+        case 0x14U: return 115200U;
+        default: return 0U;
+    }
+}
+
+static uint8_t baud_code_valid(uint8_t code)
+{
+    return baud_from_code(code) != 0U;
+}
+
+static void usart1_set_baud_code(uint8_t code)
+{
+    uint32_t baud = baud_from_code(code);
+    if(baud == 0U) return;
+    usart_disable(USART1);
+    usart_baudrate_set(USART1, baud);
+    usart_enable(USART1);
+}
+
+static void put_u32_be(uint8_t *out, uint32_t v)
+{
+    out[0] = (uint8_t)(v >> 24);
+    out[1] = (uint8_t)(v >> 16);
+    out[2] = (uint8_t)(v >> 8);
+    out[3] = (uint8_t)v;
+}
+
+static uint32_t get_u32_be(const uint8_t *in)
+{
+    return ((uint32_t)in[0] << 24) | ((uint32_t)in[1] << 16) | ((uint32_t)in[2] << 8) | in[3];
+}
+
+static uint16_t get_u16_be(const uint8_t *in)
+{
+    return (uint16_t)(((uint16_t)in[0] << 8) | in[1]);
+}
+
+static void put_float_be(uint8_t *out, float f)
+{
+    union { float f; uint32_t u; } v;
+    v.f = f;
+    put_u32_be(out, v.u);
+}
+
+static float get_float_be(const uint8_t *in)
+{
+    union { float f; uint32_t u; } v;
+    v.u = get_u32_be(in);
+    return v.f;
+}
+
+static float cfg_ratio_value(void)
+{
+    config_data_t cfg;
+    config_read_or_default(&cfg);
+    return (float)cfg.ratio;
+}
+
+static float sys_ch0_voltage(void)
+{
+    return adc_to_voltage(adc_value[0]) * cfg_ratio_value();
+}
+
+static float sys_ch1_voltage(void)
+{
+    return adc_to_voltage(g_dac_val) * cfg_ratio_value();
+}
+
+static float sys_temperature_value(void)
+{
+    return GD30AD3344_AD_Read(GD30AD3344_Channel_4, GD30AD3344_PGA_4V096);
+}
+
+static void sys_dac_apply(uint16_t value)
+{
+    if(value > 4095U) value = 4095U;
+    g_dac_val = value;
+    convertarr[0] = value;
+    dac_data_set(DAC0, DAC_OUT0, DAC_ALIGN_12B_R, value);
+}
+
+static void sys_apply_persistent_config(void)
+{
+    config_data_t cfg;
+    config_read_or_default(&cfg);
+    sys_dac_apply((uint16_t)cfg.dac_value);
+    usart1_set_baud_code((uint8_t)cfg.baud_code);
+}
+
 static void sys_send_frame(uint32_t usart, uint16_t dev_id, uint8_t type,
                            uint16_t cmd, const uint8_t *payload, uint8_t payload_len)
 {
-    uint8_t raw[48];
-    char out[160];
+    uint8_t raw[300];
+    char out[700];
     uint16_t crc;
     uint8_t i;
     int n;
@@ -419,19 +676,18 @@ static void sys_send_frame(uint32_t usart, uint16_t dev_id, uint8_t type,
     }
 
     crc = sys_crc16(raw, pos);
-    raw[pos++] = (uint8_t)(crc >> 8);
     raw[pos++] = (uint8_t)crc;
+    raw[pos++] = (uint8_t)(crc >> 8);
     raw[pos++] = SYS_TAIL_HI;
     raw[pos++] = SYS_TAIL_LO;
 
-    n = snprintf(out, sizeof(out), "A5B6 %04X %02X %04X %02X 02", dev_id, type, cmd, payload_len);
+    n = snprintf(out, sizeof(out), "A5B6%04X%02X%04X%02X02", dev_id, type, cmd, payload_len);
     if(payload_len > 0U){
-        n += snprintf(&out[n], sizeof(out) - n, " ");
         for(i = 0; i < payload_len; i++){
             n += snprintf(&out[n], sizeof(out) - n, "%02X", payload[i]);
         }
     }
-    snprintf(&out[n], sizeof(out) - n, " %04X B6A5\r\n", crc);
+    snprintf(&out[n], sizeof(out) - n, "%02X%02XB6A5\r\n", (uint8_t)crc, (uint8_t)(crc >> 8));
     my_printf(usart, "%s", out);
 }
 
@@ -440,48 +696,66 @@ static void sys_send_error(uint32_t usart, uint16_t dev_id)
     sys_send_frame(usart, dev_id, SYS_TYPE_ERR, SYS_CMD_ERR, NULL, 0U);
 }
 
-static void boot_request_reply_and_reset(uint32_t usart, uint16_t dev_id);
+static void boot_request_reply_and_reset(uint32_t usart, uint16_t dev_id, uint16_t cmd);
 
 static uint8_t sys_process_frame(uint32_t usart, const uint8_t *data, uint16_t len)
 {
-    uint8_t raw[64];
+    uint8_t raw[300];
     uint16_t raw_len;
     uint16_t dev_id, cur_id, cmd, crc_rx, crc_calc;
     uint8_t type, payload_len;
     const uint8_t *payload;
-    uint8_t rsp[4];
+    uint8_t rsp[12];
+    config_data_t cfg;
+    uint8_t ok;
 
     raw_len = ascii_to_bytes(data, len, raw, sizeof(raw));
     if(raw_len == 0U){
         return ascii_frame_prefix(data, len, "A5B6") ? 1U : 0U;
     }
+
+    cur_id = sys_device_id_get();
     if(raw_len < SYS_FRAME_MIN_LEN || raw[0] != SYS_HEAD_HI || raw[1] != SYS_HEAD_LO){
-        return 0U;
+        sys_send_error(usart, cur_id);
+        return 1U;
     }
+
+    dev_id = ((uint16_t)raw[2] << 8) | raw[3];
     if(raw[raw_len - 2U] != SYS_TAIL_HI || raw[raw_len - 1U] != SYS_TAIL_LO){
+        sys_send_error(usart, cur_id);
         return 1U;
     }
 
     payload_len = raw[7];
-    if(raw[8] != SYS_FRAME_FIXED || raw_len != (uint16_t)(SYS_FRAME_MIN_LEN + payload_len)){
-        sys_send_error(usart, sys_device_id_get());
+    cmd = ((uint16_t)raw[5] << 8) | raw[6];
+    if(raw[8] != SYS_FRAME_FIXED ||
+       (raw_len != (uint16_t)(SYS_FRAME_MIN_LEN + payload_len) &&
+        !(cmd == SYS_CMD_OTA_DATA && payload_len == 0U && raw_len == (uint16_t)(SYS_FRAME_MIN_LEN + 256U)))){
+        sys_send_error(usart, cur_id);
         return 1U;
     }
 
-    crc_rx = ((uint16_t)raw[raw_len - 4U] << 8) | raw[raw_len - 3U];
+    crc_rx = ((uint16_t)raw[raw_len - 3U] << 8) | raw[raw_len - 4U];
     crc_calc = sys_crc16(raw, raw_len - 4U);
-    dev_id = ((uint16_t)raw[2] << 8) | raw[3];
-    cur_id = sys_device_id_get();
     if(crc_rx != crc_calc){
         sys_send_error(usart, cur_id);
         return 1U;
     }
 
     type = raw[4];
-    cmd = ((uint16_t)raw[5] << 8) | raw[6];
     payload = &raw[9];
 
-    if(type == SYS_TYPE_REQ && cmd == SYS_CMD_VER_QUERY && payload_len == 0U && dev_id == cur_id){
+    if(type != SYS_TYPE_REQ || (dev_id != cur_id && dev_id != DEVICE_ID_BROADCAST)){
+        return 1U;
+    }
+
+    if(cmd == SYS_CMD_HANDSHAKE && payload_len == 0U){
+        rsp[0] = 0xFFU;
+        sys_send_frame(usart, cur_id, SYS_TYPE_RSP, SYS_CMD_HANDSHAKE, rsp, 1U);
+        return 1U;
+    }
+
+    if(cmd == SYS_CMD_VER_QUERY && payload_len == 0U){
         rsp[0] = FW_VER_MAJOR;
         rsp[1] = FW_VER_MINOR;
         rsp[2] = FW_VER_REVISION;
@@ -490,33 +764,147 @@ static uint8_t sys_process_frame(uint32_t usart, const uint8_t *data, uint16_t l
         return 1U;
     }
 
-    if(type == SYS_TYPE_REQ && cmd == SYS_CMD_ID_QUERY && payload_len == 0U &&
-       (dev_id == DEVICE_ID_BROADCAST || dev_id == cur_id)){
+    if(cmd == SYS_CMD_TIME_SET && payload_len == 4U){
+        rsp[0] = unix_to_rtc(get_u32_be(payload)) ? 0xFFU : 0xFEU;
+        sys_send_frame(usart, cur_id, SYS_TYPE_RSP, SYS_CMD_TIME_SET, rsp, 1U);
+        return 1U;
+    }
+
+    if(cmd == SYS_CMD_TIME_QUERY && payload_len == 0U){
+        put_u32_be(rsp, rtc_to_unix());
+        sys_send_frame(usart, cur_id, SYS_TYPE_RSP, SYS_CMD_TIME_QUERY, rsp, 4U);
+        return 1U;
+    }
+
+    if(cmd == SYS_CMD_ID_QUERY && payload_len == 0U){
         rsp[0] = (uint8_t)(cur_id >> 8);
         rsp[1] = (uint8_t)cur_id;
         sys_send_frame(usart, cur_id, SYS_TYPE_RSP, SYS_CMD_ID_QUERY, rsp, 2U);
         return 1U;
     }
 
-    if(type == SYS_TYPE_REQ && cmd == SYS_CMD_ID_SET && payload_len == 2U && dev_id == cur_id){
-        uint16_t new_id = ((uint16_t)payload[0] << 8) | payload[1];
+    if(cmd == SYS_CMD_BAUD_QUERY && payload_len == 0U){
+        config_read_or_default(&cfg);
+        rsp[0] = (uint8_t)cfg.baud_code;
+        sys_send_frame(usart, cur_id, SYS_TYPE_RSP, SYS_CMD_BAUD_QUERY, rsp, 1U);
+        return 1U;
+    }
+
+    if(cmd == SYS_CMD_ID_SET && payload_len == 2U && dev_id == cur_id){
+        uint16_t new_id = get_u16_be(payload);
         if(sys_device_id_set(new_id)){
             rsp[0] = 0xFFU;
             sys_send_frame(usart, new_id, SYS_TYPE_RSP, SYS_CMD_ID_SET, rsp, 1U);
         } else {
-            sys_send_error(usart, cur_id);
+            rsp[0] = 0xFEU;
+            sys_send_frame(usart, cur_id, SYS_TYPE_RSP, SYS_CMD_ID_SET, rsp, 1U);
         }
         return 1U;
     }
 
-    if(type == SYS_TYPE_RESET && cmd == SYS_CMD_RESET && payload_len == 0U && dev_id == cur_id){
-        boot_request_reply_and_reset(usart, cur_id);
+    if(cmd == SYS_CMD_BAUD_SET && payload_len == 1U && dev_id == cur_id){
+        ok = baud_code_valid(payload[0]);
+        if(ok){
+            config_read_or_default(&cfg);
+            cfg.baud_code = payload[0];
+            ok = config_write(&cfg) ? 1U : 0U;
+        }
+        rsp[0] = ok ? 0xFFU : 0xFEU;
+        sys_send_frame(usart, cur_id, SYS_TYPE_RSP, SYS_CMD_BAUD_SET, rsp, 1U);
+        if(ok){
+            delay_ms(50);
+            usart1_set_baud_code(payload[0]);
+        }
         return 1U;
     }
 
-    if(dev_id == cur_id || dev_id == DEVICE_ID_BROADCAST){
-        sys_send_error(usart, cur_id);
+    if(cmd == SYS_CMD_CH0_QUERY && payload_len == 0U){
+        put_float_be(rsp, sys_ch0_voltage());
+        sys_send_frame(usart, cur_id, SYS_TYPE_RSP, SYS_CMD_CH0_QUERY, rsp, 4U);
+        return 1U;
     }
+
+    if(cmd == SYS_CMD_CH1_QUERY && payload_len == 0U){
+        put_float_be(rsp, sys_ch1_voltage());
+        sys_send_frame(usart, cur_id, SYS_TYPE_RSP, SYS_CMD_CH1_QUERY, rsp, 4U);
+        return 1U;
+    }
+
+    if(cmd == SYS_CMD_TEMP_OR_LIMIT && payload_len == 0U){
+        put_float_be(rsp, sys_temperature_value());
+        sys_send_frame(usart, cur_id, SYS_TYPE_RSP, SYS_CMD_TEMP_OR_LIMIT, rsp, 4U);
+        return 1U;
+    }
+
+    if(cmd == SYS_CMD_TEMP_OR_LIMIT && payload_len == 4U){
+        float limit_v = get_float_be(payload);
+        uint32_t mv = (uint32_t)(limit_v * 1000.0f);
+        config_read_or_default(&cfg);
+        cfg.ch0_limit_mv = mv;
+        cfg.ch1_limit_mv = mv;
+        rsp[0] = config_write(&cfg) ? 0xFFU : 0xFEU;
+        sys_send_frame(usart, cur_id, SYS_TYPE_RSP, SYS_CMD_TEMP_OR_LIMIT, rsp, 1U);
+        return 1U;
+    }
+
+    if(cmd == SYS_CMD_PERIOD_SET && payload_len == 1U){
+        uint32_t sec = 0U;
+        if(payload[0] == 0x01U) sec = 1U;
+        else if(payload[0] == 0x02U) sec = 3U;
+        else if(payload[0] == 0x03U) sec = 5U;
+        if(sec != 0U){
+            config_read_or_default(&cfg);
+            cfg.ch0_period_sec = sec;
+            cfg.ch1_period_sec = sec;
+            cfg.limit = sec;
+            ok = config_write(&cfg) ? 1U : 0U;
+            if(ok){
+                sampling_cycle_ms = sec * 1000U;
+                sampling_active = 1U;
+                sampling_last_time = get_system_ms();
+            }
+        } else {
+            ok = 0U;
+        }
+        rsp[0] = ok ? 0xFFU : 0xFEU;
+        sys_send_frame(usart, cur_id, SYS_TYPE_RSP, SYS_CMD_PERIOD_SET, rsp, 1U);
+        return 1U;
+    }
+
+    if(cmd == SYS_CMD_DAC_SET && payload_len == 2U){
+        uint16_t dac_value = get_u16_be(payload);
+        ok = dac_value <= 4095U;
+        if(ok){
+            config_read_or_default(&cfg);
+            cfg.dac_value = dac_value;
+            ok = config_write(&cfg) ? 1U : 0U;
+            if(ok) sys_dac_apply(dac_value);
+        }
+        rsp[0] = ok ? 0xFFU : 0xFEU;
+        sys_send_frame(usart, cur_id, SYS_TYPE_RSP, SYS_CMD_DAC_SET, rsp, 1U);
+        return 1U;
+    }
+
+    if(cmd == SYS_CMD_SLEEP && payload_len == 0U){
+        rsp[0] = 0xFFU;
+        sys_send_frame(usart, cur_id, SYS_TYPE_RSP, SYS_CMD_SLEEP, rsp, 1U);
+        sampling_active = 0U;
+        sys_sleeping = 1U;
+        return 1U;
+    }
+
+    if((cmd == SYS_CMD_BOOT_ENTER || cmd == SYS_CMD_RESET) && payload_len == 0U && dev_id == cur_id){
+        boot_request_reply_and_reset(usart, cur_id, cmd);
+        return 1U;
+    }
+
+    if(cmd == SYS_CMD_OTA_DATA || cmd == SYS_CMD_OTA_DONE){
+        rsp[0] = 0xFEU;
+        sys_send_frame(usart, cur_id, SYS_TYPE_RSP, cmd, rsp, 1U);
+        return 1U;
+    }
+
+    sys_send_error(usart, cur_id);
     return 1U;
 }
 
@@ -527,9 +915,10 @@ static void boot_request_mark(void)
     RTC_BKP1 = BOOT_REQ_MAGIC;
 }
 
-static void boot_request_reply_and_reset(uint32_t usart, uint16_t dev_id)
+static void boot_request_reply_and_reset(uint32_t usart, uint16_t dev_id, uint16_t cmd)
 {
-    sys_send_frame(usart, dev_id, SYS_TYPE_RESET, SYS_CMD_RESET, NULL, 0U);
+    uint8_t rsp = 0xFFU;
+    sys_send_frame(usart, dev_id, SYS_TYPE_RSP, cmd, &rsp, 1U);
     boot_request_mark();
     delay_ms(50);
     __disable_irq();
@@ -577,38 +966,48 @@ static void sampling_process(void)
 {
     uint32_t now;
     uint32_t elapsed;
-    uint16_t adc_val;
-    float voltage;
-    rtc_parameter_struct rtc_time;
-    uint8_t year, month, date, hour, minute, second;
+    float ch0;
+    float ch1;
+    config_data_t cfg;
+    uint8_t payload[12];
+    uint8_t alarm_payload[4];
+    uint8_t new_alarm_state = 0U;
+    uint16_t dev_id;
+
+    config_read_or_default(&cfg);
+    ch0 = sys_ch0_voltage();
+    ch1 = sys_ch1_voltage();
+    dev_id = sys_device_id_get();
+
+    if(ch0 > ((float)cfg.ch0_limit_mv / 1000.0f)){
+        new_alarm_state |= 0x01U;
+    }
+    if(ch1 > ((float)cfg.ch1_limit_mv / 1000.0f)){
+        new_alarm_state |= 0x02U;
+    }
+
+    if((new_alarm_state & 0x01U) != (alarm_state & 0x01U)){
+        put_float_be(alarm_payload, ch0);
+        sys_send_frame(USART1, dev_id, SYS_TYPE_RSP, SYS_CMD_ALARM_REPORT, alarm_payload, 4U);
+    }
+    if((new_alarm_state & 0x02U) != (alarm_state & 0x02U)){
+        put_float_be(alarm_payload, ch1);
+        sys_send_frame(USART1, dev_id, SYS_TYPE_RSP, SYS_CMD_ALARM_REPORT, alarm_payload, 4U);
+    }
+    alarm_state = new_alarm_state;
 
     if (!sampling_active) {
         return;
     }
 
     now = get_system_ms();
-
-    /* 周期采样输出 */
     elapsed = now - sampling_last_time;
     if (elapsed >= sampling_cycle_ms) {
         sampling_last_time = now;
-
-        /* 获取ADC值 */
-        adc_val = adc_value[0];
-        voltage = adc_to_voltage(adc_val);
-
-        /* 获取RTC时间 */
-        rtc_current_time_get(&rtc_time);
-        year = bcd_to_dec(rtc_time.year);
-        month = bcd_to_dec(rtc_time.month);
-        date = bcd_to_dec(rtc_time.date);
-        hour = bcd_to_dec(rtc_time.hour);
-        minute = bcd_to_dec(rtc_time.minute);
-        second = bcd_to_dec(rtc_time.second);
-
-        /* 串口输出 */
-        my_printf(USART1, "20%02d-%02d-%02d %02d:%02d:%02d ch0=%.1fV\r\n",
-                  year, month, date, hour, minute, second, voltage);
+        put_u32_be(payload, rtc_to_unix());
+        put_float_be(&payload[4], ch0);
+        put_float_be(&payload[8], ch1);
+        sys_send_frame(USART1, dev_id, SYS_TYPE_RSP, SYS_CMD_AUTO_REPORT, payload, 12U);
     }
 }
 
@@ -752,6 +1151,11 @@ static void system_selftest(void)
 /* debug帧回调，解析命令 */
 void debug_uart_frame_callback(const uint8_t *d, uint16_t len)
 {
+    if (sys_sleeping) {
+        sys_sleeping = 0U;
+        my_printf(DEBUG_USART, "instrument wakeup\r\n");
+        return;
+    }
     if (sys_process_frame(DEBUG_USART, d, len)) {
         return;
     } else if (len >= 4 && d[0] == 't' && d[1] == 'e' && d[2] == 's' && d[3] == 't') {
@@ -770,6 +1174,11 @@ void debug_uart_frame_callback(const uint8_t *d, uint16_t len)
 /* USART1帧回调，解析命令 */
 void usart1_frame_callback(const uint8_t *d, uint16_t len)
 {
+    if (sys_sleeping) {
+        sys_sleeping = 0U;
+        my_printf(USART1, "instrument wakeup\r\n");
+        return;
+    }
     if (sys_process_frame(USART1, d, len)) {
         return;
     } else if (len >= 4 && d[0] == 't' && d[1] == 'e' && d[2] == 's' && d[3] == 't') {
@@ -787,6 +1196,13 @@ void usart1_frame_callback(const uint8_t *d, uint16_t len)
 
 void uart_task(void)
 {
+    static uint8_t cfg_applied = 0U;
+
+    if(!cfg_applied){
+        sys_apply_persistent_config();
+        cfg_applied = 1U;
+    }
+
     if(debug_rx_flag){
         debug_uart_frame_callback(debug_uart_dma_buffer, debug_uart_dma_len);
         memset(debug_uart_dma_buffer, 0, sizeof(debug_uart_dma_buffer));

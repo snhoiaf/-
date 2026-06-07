@@ -12,7 +12,7 @@ uint16_t g_dac_val = 0;
 
 void adc_task(void)
 {
-    /* 目前把ch10的值丢给dac输出，测试用 */
-    g_dac_val = adc_value[0];
-    convertarr[0] = g_dac_val;
+    /* ADC采样由DMA更新，DAC输出由协议命令/持久化配置控制 */
+    (void)adc_value;
+    (void)convertarr;
 }

@@ -20,6 +20,7 @@
 - [x] PC端OTA发送脚本兼容赛题固件包：自动剥离V1/V2固件前导4字节魔术字后发送裸APP镜像
 - [x] 系统自检功能（串口输入test指令，检测Flash/TF卡/RTC，输出自检结果）
 - [x] USART1命令解析（空闲中断帧检测，支持test指令）
+- [x] 评测协议基础适配：A5B6/B6A5 ASCII HEX帧、CRC16-Modbus低字节优先、A/B/C/J/K/L/M命令、0x0302自动上报、0x0411基础告警、0x0501 Bootloader入口
 - [x] RS485方向控制（PE8引脚，my_printf自动切换发送/接收模式）
 - [x] 配置管理功能（串口输入conf指令，从TF卡读取config.ini，更新Ratio和Limit到Flash）
 - [x] 周期采样功能（start/stop指令控制，LED1闪烁，串口输出采样数据，OLED显示AutoSample/IDLE状态）
