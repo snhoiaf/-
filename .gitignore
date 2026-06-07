@@ -1,0 +1,20 @@
+# Build outputs
+Project/**/MDK/output/
+Project/**/MDK/list/
+Project/**/MDK/Listings/
+Project/**/MDK/Objects/
+
+# Keil / embedded intermediate artifacts outside output folders
+*.o
+*.d
+*.crf
+*.lst
+*.map
+*.axf
+*.htm
+*.lnp
+*.dep
+
+# Temporary files
+*.tmp
+*.bak
