@@ -288,6 +288,64 @@ extern uint8_t usart1_rx_buf[USART1_RX_BUF_SIZE];
 #define FIRMWARE_MAGIC  0x5AA5C33CUL
 #define OTA_CHUNK_SIZE  256U
 
+/* ===== 读取APP持久化配置(0x0807D000)，让BL波特率/ID跟随APP =====
+ * 评测M阶段后APP切到115200，BL必须同步否则N阶段收发全乱码。
+ * APP的config_data_t与CRC32算法(0xEDB88320)在此对齐。 */
+#define APP_CONFIG_ADDR   BL_DATA_START_ADDR
+#define APP_CONFIG_MAGIC  0x434F4E46UL   /* "CONF" */
+
+/* APP config_data_t 镜像(字段顺序须与APP usart_app.c一致) */
+typedef struct {
+    uint32_t magic;
+    uint32_t ratio;
+    uint32_t limit;
+    uint32_t device_id;
+    uint32_t ch0_limit_mv;
+    uint32_t ch1_limit_mv;
+    uint32_t ch0_period_sec;
+    uint32_t ch1_period_sec;
+    uint32_t dac_value;
+    uint32_t baud_code;
+    uint32_t ch0_ratio_bits;
+    uint32_t ch1_ratio_bits;
+    uint32_t ch0_thr_bits;
+    uint32_t ch1_thr_bits;
+    uint32_t crc32;
+} app_config_t;
+
+static uint32_t bl_baud_from_code(uint32_t code)
+{
+    switch(code){
+        case 0x11U: return 19200U;
+        case 0x12U: return 38400U;
+        case 0x13U: return 57600U;
+        case 0x14U: return 115200U;
+        default:    return 0U;
+    }
+}
+
+/* 读APP配置，校验magic+CRC32通过则输出baud/id，返回1成功 */
+static uint8_t bl_read_app_config(uint32_t *baud, uint16_t *dev_id)
+{
+    const app_config_t *cfg = (const app_config_t *)APP_CONFIG_ADDR;
+    uint32_t crc;
+
+    if(cfg->magic != APP_CONFIG_MAGIC) return 0U;
+    crc = bl_crc((const uint8_t*)cfg, (uint32_t)((const uint8_t*)&cfg->crc32 - (const uint8_t*)cfg));
+    if(crc != cfg->crc32) return 0U;
+
+    if(baud){
+        uint32_t b = bl_baud_from_code(cfg->baud_code);
+        if(b != 0U) *baud = b;
+    }
+    if(dev_id){
+        if(cfg->device_id >= 0x0001U && cfg->device_id <= 0xFFFEU){
+            *dev_id = (uint16_t)cfg->device_id;
+        }
+    }
+    return 1U;
+}
+
 static uint16_t bl_crc16(const uint8_t *data, uint16_t len)
 {
     uint16_t crc = 0xFFFFU;
@@ -594,6 +652,17 @@ static void bootloader_wait_cmd(bl_param_t *work)
     uint32_t remain;
     uint8_t  frame[64];
     uint32_t flen;
+    uint32_t app_baud = 0U;
+
+    /* ★ 关键(真凶3)：读APP持久化配置，让BL波特率/ID跟随APP。
+     * 评测M阶段后APP切115200，BL默认19200会导致N阶段收发全乱码。 */
+    if(bl_read_app_config(&app_baud, &dev_id)){
+        if(app_baud != 0U){
+            usart_disable(USART1);
+            usart_baudrate_set(USART1, app_baud);
+            usart_enable(USART1);
+        }
+    }
 
     /* N-01: 评测扫描窗口需重复关键字。先关IDLE中断，OTA全程走字节级游标 */
     usart_interrupt_disable(USART1, USART_INT_IDLE);
