@@ -126,6 +126,7 @@ static volatile uint8_t sampling_active = 0;      /* 采样状态：0=停止，1
 static volatile uint32_t sampling_cycle_ms = 5000; /* 采样周期，默认5秒 */
 static volatile uint32_t sampling_last_time = 0;   /* 上次采样时间 */
 static volatile uint8_t sys_sleeping = 0;           /* 协议睡眠状态 */
+volatile uint8_t rtc_alarm_wakeup_flag = 0;         /* RTC闹钟唤醒标志 */
 static uint8_t alarm_state = 0;                     /* bit0=CH0告警, bit1=CH1告警 */
 
 __IO uint8_t  debug_rx_flag = 0;
@@ -1026,8 +1027,25 @@ static uint8_t sys_process_frame(uint32_t usart, const uint8_t *data, uint16_t l
     if(cmd == SYS_CMD_SLEEP && payload_len == 0U){
         rsp[0] = 0xFFU;
         sys_send_frame(usart, cur_id, SYS_TYPE_RSP, SYS_CMD_SLEEP, rsp, 1U);
+
+        /* 等待发送完成 */
+        delay_1ms(100);
+
+        /* 停止采样 */
         sampling_active = 0U;
-        sys_sleeping = 1U;
+
+        /* 配置RTC闹钟10秒后唤醒 */
+        bsp_rtc_alarm_set(10);
+
+        /* 进入Stop模式 */
+        bsp_enter_stop_mode();
+
+        /* 唤醒后发送字符串 */
+        if(rtc_alarm_wakeup_flag){
+            rtc_alarm_wakeup_flag = 0;
+            my_printf(usart, "instrument wakeup\r\n");
+        }
+
         return 1U;
     }
 

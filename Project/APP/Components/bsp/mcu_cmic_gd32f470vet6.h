@@ -355,6 +355,8 @@ void bsp_dac_init(void);
 #define BKP_MAGIC  0x32F0
 
 int bsp_rtc_init(void);
+void bsp_rtc_alarm_set(uint32_t seconds_later);
+void bsp_enter_stop_mode(void);
 
 /*=============================================
  * 兼容旧宏名（中断/usart_app/gd30ad3344等引用）

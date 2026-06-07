@@ -525,3 +525,65 @@ int bsp_rtc_init(void)
     rcu_all_reset_flag_clear();
     return ret;
 }
+
+/* 配置RTC闹钟：seconds_later秒后触发 */
+void bsp_rtc_alarm_set(uint32_t seconds_later)
+{
+    rtc_parameter_struct current_time;
+    rtc_alarm_struct alarm_cfg;
+    uint32_t total_sec, alarm_sec;
+    uint8_t h, m, s;
+
+    /* 读取当前时间 */
+    rtc_current_time_get(&current_time);
+
+    /* BCD转十进制 */
+    h = ((current_time.hour >> 4) & 0x0F) * 10 + (current_time.hour & 0x0F);
+    m = ((current_time.minute >> 4) & 0x0F) * 10 + (current_time.minute & 0x0F);
+    s = ((current_time.second >> 4) & 0x0F) * 10 + (current_time.second & 0x0F);
+
+    /* 计算闹钟时间 */
+    total_sec = h * 3600 + m * 60 + s + seconds_later;
+    total_sec %= 86400;  /* 24小时循环 */
+
+    alarm_sec = total_sec;
+    h = alarm_sec / 3600;
+    m = (alarm_sec % 3600) / 60;
+    s = alarm_sec % 60;
+
+    /* 十进制转BCD */
+    alarm_cfg.alarm_hour = ((h / 10) << 4) | (h % 10);
+    alarm_cfg.alarm_minute = ((m / 10) << 4) | (m % 10);
+    alarm_cfg.alarm_second = ((s / 10) << 4) | (s % 10);
+
+    alarm_cfg.alarm_day = 0x01;
+    alarm_cfg.weekday_or_date = RTC_ALARM_DATE_SELECTED;
+    alarm_cfg.alarm_mask = RTC_ALARM_DATE_MASK;  /* 只匹配时分秒 */
+    alarm_cfg.am_pm = RTC_AM;
+
+    /* 禁用闹钟A */
+    rtc_alarm_disable(RTC_ALARM0);
+
+    /* 配置闹钟 */
+    rtc_alarm_config(RTC_ALARM0, &alarm_cfg);
+
+    /* 使能闹钟中断 */
+    rtc_interrupt_enable(RTC_INT_ALARM0);
+    exti_interrupt_flag_clear(EXTI_17);
+    exti_init(EXTI_17, EXTI_INTERRUPT, EXTI_TRIG_RISING);
+
+    nvic_irq_enable(RTC_Alarm_IRQn, 0, 0);
+
+    /* 使能闹钟 */
+    rtc_alarm_enable(RTC_ALARM0);
+}
+
+/* 进入Stop模式，等待RTC闹钟唤醒 */
+void bsp_enter_stop_mode(void)
+{
+    /* 使能PWR时钟 */
+    rcu_periph_clock_enable(RCU_PMU);
+
+    /* 配置Stop模式：低功耗，电压调节器低功耗模式，正常驱动 */
+    pmu_to_deepsleepmode(PMU_LDO_LOWPOWER, PMU_LOWDRIVER_DISABLE, WFI_CMD);
+}

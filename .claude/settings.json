@@ -10,7 +10,9 @@
       "Bash(python3 -c \"print\\('0502:', 'A5B6000101050200 02255AB6A5'.replace\\(' ',''\\)\\)\")",
       "Bash(python3 -c ' *)",
       "Bash(git add *)",
-      "Bash(git commit -m ' *)"
+      "Bash(git commit -m ' *)",
+      "Bash(python test_de_persist.py)",
+      "Bash(\"C:\\\\keil5\\\\UV4\\\\UV4.exe\" -b Project.uvprojx -j0 -o build.log)"
     ]
   }
 }

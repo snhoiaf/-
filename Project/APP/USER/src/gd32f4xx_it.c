@@ -235,3 +235,20 @@ void SysTick_Handler(void)
 {
     delay_decrement();
 }
+
+/*!
+    \brief      RTC Alarm interrupt handler
+    \param[in]  none
+    \param[out] none
+    \retval     none
+*/
+extern volatile uint8_t rtc_alarm_wakeup_flag;
+
+void RTC_Alarm_IRQHandler(void)
+{
+    if(RESET != rtc_flag_get(RTC_FLAG_ALRM0)){
+        rtc_flag_clear(RTC_FLAG_ALRM0);
+        exti_interrupt_flag_clear(EXTI_17);
+        rtc_alarm_wakeup_flag = 1;
+    }
+}
