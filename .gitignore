@@ -18,3 +18,7 @@ Project/**/MDK/Objects/
 # Temporary files
 *.tmp
 *.bak
+
+# Python cache
+__pycache__/
+*.pyc

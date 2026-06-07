@@ -40,6 +40,22 @@ def parse_int(text: str) -> int:
     return int(text, 0)
 
 
+def normalize_firmware_payload(data: bytes):
+    """Strip contest package magic if present and return raw APP image."""
+    magic_prefixes = (
+        struct.pack("<I", MAGIC),
+        struct.pack(">I", MAGIC),
+    )
+    if len(data) >= 12 and data[:4] in magic_prefixes:
+        initial_sp = struct.unpack_from("<I", data, 4)[0]
+        reset_vector = struct.unpack_from("<I", data, 8)[0]
+        sp_in_sram = 0x20000000 <= initial_sp <= 0x20040000
+        reset_in_app = APP1_START_ADDR <= reset_vector < (APP1_START_ADDR + APP_MAX_SIZE)
+        if sp_in_sram and reset_in_app:
+            return data[4:], True
+    return data, False
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="GD32 OTA UART sender")
     parser.add_argument("--port", required=True, help="Serial port, e.g. COM5")
@@ -62,7 +78,9 @@ def main() -> int:
     args = parser.parse_args()
 
     with open(args.bin, "rb") as f:
-        payload = f.read()
+        raw_payload = f.read()
+
+    payload, stripped_package_magic = normalize_firmware_payload(raw_payload)
 
     if not payload:
         print("Firmware is empty")
@@ -95,6 +113,8 @@ def main() -> int:
     print(f"port      : {args.port}")
     print(f"baud      : {args.baud}")
     print(f"firmware  : {args.bin}")
+    if stripped_package_magic:
+        print("package   : stripped 4-byte contest magic")
     print(f"version   : 0x{args.version:08X}")
     print(f"size      : {app_size} bytes")
     print(f"crc32     : 0x{app_crc32:08X}")

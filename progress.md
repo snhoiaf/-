@@ -17,6 +17,7 @@
 - [x] Debug串口（USART0，115200，DMA接收，空闲中断帧检测）
 - [x] OTA串口（USART2，921600，DMA循环接收）
 - [x] PC端OTA发送脚本（`Tools/ota_uart_sender.py`）
+- [x] PC端OTA发送脚本兼容赛题固件包：自动剥离V1/V2固件前导4字节魔术字后发送裸APP镜像
 - [x] 系统自检功能（串口输入test指令，检测Flash/TF卡/RTC，输出自检结果）
 - [x] USART1命令解析（空闲中断帧检测，支持test指令）
 - [x] RS485方向控制（PE8引脚，my_printf自动切换发送/接收模式）

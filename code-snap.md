@@ -1,5 +1,7 @@
 # V2BL 代码骨架接口清单
 
+| `Tools/ota_uart_sender.py` | PC侧OTA发送脚本，支持START/DATA/END发送；自动识别并剥离赛题V1/V2固件包前导4字节magic后，按裸APP镜像计算size/crc并发送 |
+
 ## 全局宏
 
 ### 分区相关 (bl_partition.h)
