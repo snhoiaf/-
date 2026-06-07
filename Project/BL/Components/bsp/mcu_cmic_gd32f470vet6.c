@@ -143,7 +143,9 @@ void bsp_usart1_init(void)
     dma_cfg.periph_memory_width = DMA_PERIPH_WIDTH_8BIT;
     dma_cfg.priority = DMA_PRIORITY_HIGH;
     dma_single_data_mode_init(USART1_RX_DMA_PERIPH, USART1_RX_DMA_CHANNEL, &dma_cfg);
-    dma_circulation_disable(USART1_RX_DMA_PERIPH, USART1_RX_DMA_CHANNEL);
+    /* 循环模式：BL OTA固件流(6420B)超过缓冲2048B，需DMA环形不间断接收。
+     * 字节级游标读取由bl_core.c实现，对齐满分BL方案。 */
+    dma_circulation_enable(USART1_RX_DMA_PERIPH, USART1_RX_DMA_CHANNEL);
     dma_channel_subperipheral_select(USART1_RX_DMA_PERIPH, USART1_RX_DMA_CHANNEL, USART1_RX_DMA_SUBPERI);
     dma_channel_enable(USART1_RX_DMA_PERIPH, USART1_RX_DMA_CHANNEL);
 

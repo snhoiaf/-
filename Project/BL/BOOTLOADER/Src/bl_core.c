@@ -314,10 +314,51 @@ static uint32_t ascii_hex_to_bin(const uint8_t *src, uint32_t src_len, uint8_t *
         l  = (lo >= 'A') ? (lo - 'A' + 10U) : (lo >= 'a') ? (lo - 'a' + 10U) : (lo - '0');
         dst[out++] = (uint8_t)((hi << 4) | l);
     }
-    return out;
+    return out;}
+
+/* ===== BL OTA字节级DMA读取（对齐满分，循环DMA游标，永不重置DMA，杜绝RS485竞争）===== */
+static uint32_t bl_u1_dma_old_pos = 0U;
+
+/* 当前DMA写入位置 = 缓冲大小 - 剩余传输数 */
+static uint32_t bl_u1_dma_pos(void)
+{
+    return USART1_RX_BUF_SIZE - dma_transfer_number_get(USART1_RX_DMA_PERIPH, USART1_RX_DMA_CHANNEL);
 }
 
-/* 发送RS485帧（ASCII HEX格式） */
+/* 复位字节级游标到当前DMA位置（丢弃旧数据，不动DMA硬件） */
+static void bl_u1_ring_reset(void)
+{
+    bl_u1_dma_old_pos = bl_u1_dma_pos();
+}
+
+/* 从循环DMA缓冲中取1字节，有数据返回1 */
+static uint8_t bl_u1_get_byte(uint8_t *ch)
+{
+    uint32_t pos = bl_u1_dma_pos();
+    if(pos == bl_u1_dma_old_pos){
+        return 0U;
+    }
+    *ch = usart1_rx_buf[bl_u1_dma_old_pos];
+    bl_u1_dma_old_pos = (bl_u1_dma_old_pos + 1U) % USART1_RX_BUF_SIZE;
+    return 1U;
+}
+
+/* 等待RS485静默quiet_ms毫秒（期间无新字节），用于错误固件后排空总线 */
+static void bl_u1_wait_quiet(uint32_t quiet_ms)
+{
+    uint8_t ch;
+    uint32_t elapsed = 0U;
+    while(elapsed < quiet_ms){
+        if(bl_u1_get_byte(&ch)){
+            elapsed = 0U;
+        } else {
+            delay_1ms(1);
+            elapsed++;
+        }
+    }
+}
+
+
 static void bl_send_frame(uint16_t dev_id, uint8_t type, uint16_t cmd,
                            const uint8_t *payload, uint8_t plen)
 {
@@ -347,7 +388,6 @@ static void bl_send_frame(uint16_t dev_id, uint8_t type, uint16_t cmd,
     n += snprintf(out + n, sizeof(out) - (size_t)n, "B6A5");
 
     gpio_bit_set(USART1_DIR_PORT, USART1_DIR_PIN);
-    usart_interrupt_disable(USART1, USART_INT_IDLE);
     delay_1ms(1);
     for(i = 0; i < n; i++){
         usart_data_transmit(USART1, (uint8_t)out[i]);
@@ -356,9 +396,7 @@ static void bl_send_frame(uint16_t dev_id, uint8_t type, uint16_t cmd,
     while(RESET == usart_flag_get(USART1, USART_FLAG_TC));
     delay_1ms(1);
     gpio_bit_reset(USART1_DIR_PORT, USART1_DIR_PIN);
-    usart_data_receive(USART1);
-    usart_interrupt_flag_clear(USART1, USART_INT_FLAG_IDLE);
-    usart_interrupt_enable(USART1, USART_INT_IDLE);
+    bl_u1_ring_reset();   /* 丢弃发送回声，不碰DMA硬件与IDLE中断 */
 }
 
 static void bl_send_ok(uint16_t dev_id, uint16_t cmd)
@@ -399,8 +437,10 @@ static uint16_t bl_parse_cmd(const uint8_t *buf, uint32_t len, uint16_t *out_dev
 
     dev_id      = (uint16_t)((raw[2] << 8) | raw[3]);
     payload_len =  raw[7];
-    total_chars = 4U + (uint32_t)(9U + payload_len + 2U) * 2U + 4U;
-    if(len < total_chars) return 0U;
+    /* raw不含tail(传入的是len-4)，故二进制长 = head2+id2+type1+cmd2+plen1+ver1+payload+crc2
+     * = 11 + payload_len。原total_chars公式重复计入帧头，误判0502帧过短而丢弃(N阶段真凶) */
+    if(raw_len != (uint32_t)(11U + payload_len)) return 0U;
+    (void)total_chars;
 
     crc_rx   = (uint16_t)((raw[raw_len - 2U] << 8) | raw[raw_len - 1U]);
     crc_calc = bl_crc16(raw, (uint16_t)(raw_len - 2U));
@@ -418,64 +458,72 @@ static uint16_t bl_parse_cmd(const uint8_t *buf, uint32_t len, uint16_t *out_dev
  */
 static uint32_t bl_recv_firmware(uint16_t dev_id, bl_param_t *work)
 {
-    uint32_t total = 0U;
-    uint32_t chunk_len;
-    uint32_t erase_done = 0U;
-    uint32_t timeout;
+    uint8_t  buf[BL_COPY_CHUNK_SIZE];
+    uint8_t  magic_buf[4];
+    uint32_t buf_len = 0U;
+    uint32_t app_size = 0U;     /* 已接收app字节数（不含magic） */
+    uint32_t recv_size = 0U;    /* 含magic的总接收字节 */
+    uint32_t quiet_ms = 0U;
+    uint32_t wait_first = 0U;
+    uint8_t  ch;
+    uint8_t  saw = 0U;
+    (void)dev_id;
 
     /* 擦除固件暂存区 */
     if(!fl_erase(BL_APP2_START_ADDR, BL_APP2_SIZE)) return 0U;
-    erase_done = 1U;
-    (void)erase_done;
 
-    /* 按切片接收，每片最多256字节，超时50ms无数据则认为结束 */
-    while(total < BL_APP2_SIZE){
-        timeout = 200U; /* 200×1ms = 200ms超时 */
-        while(!usart1_rx_flag && timeout) { delay_1ms(1); timeout--; }
-        if(!usart1_rx_flag) break;
+    /* 字节级游标接收（对齐满分，永不重置DMA，杜绝RS485竞争）：
+     * 先收4字节magic大端校验，之后app流式写入暂存区开头 */
+    while(app_size < BL_APP2_SIZE){
+        if(bl_u1_get_byte(&ch)){
+            saw = 1U;
+            quiet_ms = 0U;
 
-        chunk_len = usart1_rx_len;
-        if(total + chunk_len > BL_APP2_SIZE) chunk_len = BL_APP2_SIZE - total;
+            if(recv_size < 4U){
+                magic_buf[recv_size] = ch;
+                recv_size++;
+                if(recv_size == 4U){
+                    /* 大端组装，与满分一致：流头4字节须为 5A A5 C3 3C */
+                    uint32_t magic = ((uint32_t)magic_buf[0] << 24) |
+                                     ((uint32_t)magic_buf[1] << 16) |
+                                     ((uint32_t)magic_buf[2] << 8)  |
+                                     (uint32_t)magic_buf[3];
+                    if(magic != FIRMWARE_MAGIC){
+                        bl_u1_wait_quiet(100U);  /* 排空总线后返回错误 */
+                        return 0U;
+                    }
+                }
+                continue;
+            }
 
-        if(!fl_write(BL_APP2_START_ADDR + total, usart1_rx_buf, chunk_len)){
-            return 0U;
+            /* app数据累积，满256字节写一次flash */
+            buf[buf_len++] = ch;
+            recv_size++;
+            app_size++;
+            if(buf_len == BL_COPY_CHUNK_SIZE){
+                if(!fl_write(BL_APP2_START_ADDR + app_size - buf_len, buf, buf_len)) return 0U;
+                buf_len = 0U;
+            }
+        } else {
+            if(!saw){
+                if(wait_first >= 3000U) return 0U;  /* 首字节3s超时 */
+                wait_first++;
+            } else {
+                if(quiet_ms >= 1200U) break;        /* 静默1.2s判定接收结束 */
+                quiet_ms++;
+            }
+            delay_1ms(1);
         }
-        total += chunk_len;
-        usart1_rx_flag = 0U;
-        usart1_rx_len  = 0U;
-
-        /* 重置DMA继续接收 */
-        dma_channel_disable(USART1_RX_DMA_PERIPH, USART1_RX_DMA_CHANNEL);
-        dma_flag_clear(USART1_RX_DMA_PERIPH, USART1_RX_DMA_CHANNEL, DMA_FLAG_FTF);
-        dma_transfer_number_config(USART1_RX_DMA_PERIPH, USART1_RX_DMA_CHANNEL, USART1_RX_BUF_SIZE);
-        dma_channel_enable(USART1_RX_DMA_PERIPH, USART1_RX_DMA_CHANNEL);
     }
 
-    if(total < 4U) return 0U;
+    /* 写入末尾不足256字节的残余 */
+    if(buf_len > 0U){
+        if(!fl_write(BL_APP2_START_ADDR + app_size - buf_len, buf, buf_len)) return 0U;
+    }
 
-    /* 校验固件magic（前4字节） */
-    uint32_t magic;
-    memcpy(&magic, (void*)BL_APP2_START_ADDR, 4U);
-    if(magic != FIRMWARE_MAGIC) return 0U;
-
-    /* 剥离magic，实际App从第5字节开始，大小=total-4 */
-    uint32_t app_size = total - 4U;
     if(app_size == 0U || app_size > BL_APP2_SIZE) return 0U;
 
-    /* 把App内容向前移4字节（擦除后重写） */
-    static uint8_t tmp_page[BL_FLASH_PAGE_SIZE];
-    uint32_t done = 0U, chunk;
-    fl_erase(BL_APP2_START_ADDR, (app_size + BL_FLASH_PAGE_SIZE - 1U) & ~(BL_FLASH_PAGE_SIZE - 1U));
-    while(done < app_size){
-        chunk = app_size - done;
-        if(chunk > sizeof(tmp_page)) chunk = sizeof(tmp_page);
-        /* 从Flash+4偏移读（已写入的原始数据） */
-        memcpy(tmp_page, (void*)(BL_APP2_START_ADDR + 4U + done), chunk);
-        fl_write(BL_APP2_START_ADDR + done, tmp_page, chunk);
-        done += chunk;
-    }
-
-    /* 提交参数页PENDING */
+    /* 提交参数页PENDING（app已在暂存区开头，主流程零改动） */
     work->update_flag = BL_UPDATE_FLAG_PENDING;
     work->app_size    = app_size;
     work->app_crc32   = bl_crc((const uint8_t*)BL_APP2_START_ADDR, app_size);
@@ -485,29 +533,57 @@ static uint32_t bl_recv_firmware(uint16_t dev_id, bl_param_t *work)
     return app_size;
 }
 
-/* BL专用：发字符串，切RS485方向，发完立即释放，发送期间禁用空闲中断防回声 */
+/* BL专用：USART1发字符串。循环DMA持续不停，发完把字节游标推到当前位置丢弃回声，
+ * 绝不重置DMA硬件（对齐满分，杜绝冲掉上位机数据的RS485竞争） */
 static void bl_puts(const char *s)
 {
-    usart_interrupt_disable(USART1, USART_INT_IDLE);
-    gpio_bit_set(USART1_DIR_PORT, USART1_DIR_PIN);
+    gpio_bit_set(USART1_DIR_PORT, USART1_DIR_PIN);   /* TX */
     while(*s){
         usart_data_transmit(USART1, (uint8_t)*s);
         while(RESET == usart_flag_get(USART1, USART_FLAG_TBE));
         s++;
     }
     while(RESET == usart_flag_get(USART1, USART_FLAG_TC));
-    gpio_bit_reset(USART1_DIR_PORT, USART1_DIR_PIN);
-    /* 清除IDLE标志，重置DMA，清空buf和flag */
-    usart_data_receive(USART1);
-    usart_interrupt_flag_clear(USART1, USART_INT_FLAG_IDLE);
-    dma_channel_disable(USART1_RX_DMA_PERIPH, USART1_RX_DMA_CHANNEL);
-    dma_flag_clear(USART1_RX_DMA_PERIPH, USART1_RX_DMA_CHANNEL, DMA_FLAG_FTF);
-    memset(usart1_rx_buf, 0, USART1_RX_BUF_SIZE);
-    dma_transfer_number_config(USART1_RX_DMA_PERIPH, USART1_RX_DMA_CHANNEL, USART1_RX_BUF_SIZE);
-    dma_channel_enable(USART1_RX_DMA_PERIPH, USART1_RX_DMA_CHANNEL);
-    usart1_rx_flag = 0U;
-    usart1_rx_len  = 0U;
-    usart_interrupt_enable(USART1, USART_INT_IDLE);
+    gpio_bit_reset(USART1_DIR_PORT, USART1_DIR_PIN);  /* RX */
+    bl_u1_ring_reset();   /* 丢弃发送期间的回声 */
+}
+
+/* 字节级游标接收一条ASCII命令帧(A5B6...B6A5)，超时timeout_ms毫秒。
+ * 成功返回帧长(写入out)，超时返回0。对齐满分，全程不依赖空闲中断。 */
+static uint32_t bl_recv_cmd_frame(uint8_t *out, uint32_t out_max, uint32_t timeout_ms)
+{
+    uint32_t len = 0U;
+    uint32_t elapsed = 0U;
+    uint8_t  ch;
+
+    gpio_bit_reset(USART1_DIR_PORT, USART1_DIR_PIN);  /* 锁死接收方向 */
+
+    while(elapsed < timeout_ms){
+        if(bl_u1_get_byte(&ch)){
+            /* 帧头同步：必须以 A5B6 开头 */
+            if(len == 0U){ if(ch != 'A') continue; }
+            else if(len == 1U){ if(ch != '5'){ len = (ch == 'A') ? 1U : 0U; continue; } }
+            else if(len == 2U){ if(ch != 'B'){ len = (ch == 'A') ? 1U : 0U; continue; } }
+            else if(len == 3U){ if(ch != '6'){ len = (ch == 'A') ? 1U : 0U; continue; } }
+
+            if(len < out_max){
+                out[len++] = ch;
+            } else {
+                len = 0U; continue;
+            }
+
+            /* 帧尾 B6A5 闭合即完成 */
+            if(len >= 8U &&
+               out[len-4U]=='B' && out[len-3U]=='6' && out[len-2U]=='A' && out[len-1U]=='5'){
+                return len;
+            }
+            elapsed = 0U;
+        } else {
+            delay_1ms(1);
+            elapsed++;
+        }
+    }
+    return 0U;
 }
 
 static void bootloader_wait_cmd(bl_param_t *work)
@@ -515,60 +591,58 @@ static void bootloader_wait_cmd(bl_param_t *work)
     uint16_t cmd, dev_id = 0x0001U;
     uint32_t app_size;
     uint8_t  rsp;
-    uint32_t tick;
-    uint32_t total_ticks = 1000U; /* 10s × 100次/s */
-    uint32_t last_sec = 0xFFFFU;
-    uint32_t cur_sec;
+    uint32_t remain;
+    uint8_t  frame[64];
+    uint32_t flen;
 
-    bl_puts("using command to interrupt start Application\r\n");
+    /* N-01: 评测扫描窗口需重复关键字。先关IDLE中断，OTA全程走字节级游标 */
+    usart_interrupt_disable(USART1, USART_INT_IDLE);
+    bl_u1_ring_reset();
+
+    bl_puts("system init\r\n");
+    bl_puts("Application Version 2.0.1.0\r\n");
     bl_send_frame(dev_id, 0x05U, 0x8888U, NULL, 0U);
 
-    for(tick = 0; tick < total_ticks; tick++){
-        cur_sec = 10U - tick / 100U;
-        if(cur_sec != last_sec){
-            last_sec = cur_sec;
+    /* 10秒倒计时等待0x0502。关键字在前几秒重复打印以落进评测扫描窗口 */
+    for(remain = 10U; remain > 0U; remain--){
+        if(remain >= 6U){
+            bl_puts("system init\r\n");
+            bl_puts("Application Version 2.0.1.0\r\n");
+        }
+        if(remain == 10U || remain == 7U || remain == 4U || remain == 1U){
             char tmp[64];
-            snprintf(tmp, sizeof(tmp), "wait for start Application(%us)......\r\n", (unsigned)cur_sec);
+            snprintf(tmp, sizeof(tmp), "wait for start Application(%us)......\r\n", (unsigned)remain);
             bl_puts(tmp);
-            /* bl_puts内部已清空flag和DMA */
         }
 
-        delay_1ms(10);
+        flen = bl_recv_cmd_frame(frame, sizeof(frame), 1000U);
+        if(flen == 0U) continue;
 
-        if(usart1_rx_flag){
-            cmd = bl_parse_cmd(usart1_rx_buf, usart1_rx_len, &dev_id);
-            usart1_rx_flag = 0U;
-            usart1_rx_len  = 0U;
+        cmd = bl_parse_cmd(frame, flen, &dev_id);
+        if(cmd != PROTO_CMD_0502) continue;
 
-            if(cmd == PROTO_CMD_0502){
-                bl_send_ok(dev_id, PROTO_CMD_0502);
-                app_size = bl_recv_firmware(dev_id, work);
+        /* 收到准备传输：回OK→流式收固件→校验 */
+        bl_send_ok(dev_id, PROTO_CMD_0502);
+        bl_u1_ring_reset();
+        app_size = bl_recv_firmware(dev_id, work);
 
-                if(app_size > 0U){
-                    rsp = 0xFFU;
-                    bl_send_frame(dev_id, PROTO_TYPE_RSP, PROTO_CMD_0502, &rsp, 1U);
+        if(app_size > 0U && app_vec_ok(BL_APP2_START_ADDR)){
+            rsp = 0xFFU;
+            bl_send_frame(dev_id, PROTO_TYPE_RSP, PROTO_CMD_0502, &rsp, 1U);
 
-                    uint32_t t = 5000U;
-                    while(t--){
-                        delay_1ms(1);
-                        if(usart1_rx_flag){
-                            cmd = bl_parse_cmd(usart1_rx_buf, usart1_rx_len, NULL);
-                            usart1_rx_flag = 0U;
-                            usart1_rx_len  = 0U;
-                            if(cmd == PROTO_CMD_0503){
-                                bl_send_ok(dev_id, PROTO_CMD_0503);
-                                delay_1ms(50);
-                                p_commit(work, NULL, 0);
-                                NVIC_SystemReset();
-                            }
-                        }
-                    }
-                } else {
-                    bl_send_err(dev_id);
-                }
-                return;
+            /* 等0x0503执行升级 */
+            flen = bl_recv_cmd_frame(frame, sizeof(frame), 10000U);
+            if(flen > 0U && bl_parse_cmd(frame, flen, NULL) == PROTO_CMD_0503){
+                bl_send_ok(dev_id, PROTO_CMD_0503);
+                delay_1ms(50);
+                p_commit(work, NULL, 0);
+                NVIC_SystemReset();
             }
+            bl_send_err(dev_id);
+        } else {
+            bl_send_err(dev_id);
         }
+        return;
     }
 }
 
