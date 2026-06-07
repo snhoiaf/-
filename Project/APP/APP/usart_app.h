@@ -9,5 +9,6 @@ void ota_reset_state(void);
 uint8_t sampling_is_active(void);
 void debug_uart_frame_callback(const uint8_t *d, uint16_t len);
 void usart1_frame_callback(const uint8_t *d, uint16_t len);
+uint8_t config_restore_factory(void);   /* 恢复出厂: ID0001+19200 */
 
 #endif

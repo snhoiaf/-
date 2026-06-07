@@ -382,6 +382,18 @@ static bool config_write(const config_data_t *cfg)
     return true;
 }
 
+/* 恢复出厂配置：ID=0x0001, 波特率=19200(code 0x11), 其余默认。
+ * 供按键长按调用，写Flash持久化后需重启或重设串口波特率生效。
+ * 返回true成功。 */
+uint8_t config_restore_factory(void)
+{
+    config_data_t cfg;
+    config_default(&cfg);
+    cfg.device_id = DEVICE_ID_DEFAULT;   /* 0x0001 */
+    cfg.baud_code = 0x11U;               /* 强制19200(当前映射表0x11=19200) */
+    return config_write(&cfg) ? 1U : 0U;
+}
+
 /* 解析INI文件中的值 */
 static bool parse_ini_value(const char *content, const char *key, uint32_t *value)
 {
