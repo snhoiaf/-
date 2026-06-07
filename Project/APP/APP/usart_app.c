@@ -27,6 +27,8 @@ extern uint16_t convertarr[CONVERT_NUM];
 #define CONFIG_DEFAULT_PERIOD     5UL
 #define CONFIG_DEFAULT_DAC        0UL
 #define CONFIG_DEFAULT_BAUD_CODE  0x13U
+#define CONFIG_DEFAULT_RATIO_F    1.0f       /* 默认变比1.0 */
+#define CONFIG_DEFAULT_THR_F      2.5f       /* 默认阈值2.5 */
 
 #define DEVICE_ID_DEFAULT    0x0001U
 #define DEVICE_ID_MIN        0x0001U
@@ -57,14 +59,23 @@ extern uint16_t convertarr[CONVERT_NUM];
 #define SYS_CMD_ID_SET       0x01A1U
 #define SYS_CMD_BAUD_SET     0x01A2U
 #define SYS_CMD_CH0_QUERY    0x0201U
-#define SYS_CMD_CH1_QUERY    0x0221U
+#define SYS_CMD_CH1_QUERY    0x0202U
+#define SYS_CMD_CH2_QUERY    0x0221U
 #define SYS_CMD_TEMP_OR_LIMIT 0x0241U
+#define SYS_CMD_CH1_RATIO_SET 0x0242U
+#define SYS_CMD_THR_QUERY_ALL 0x0400U  /* 批量读阈值(CH0+CH1) */
+#define SYS_CMD_CH0_THR_QUERY 0x0401U
+#define SYS_CMD_CH1_THR_QUERY 0x0402U
+#define SYS_CMD_CH0_THR_SET   0x0411U
+#define SYS_CMD_CH1_THR_SET   0x0412U
 #define SYS_CMD_PERIOD_SET   0x0261U
 #define SYS_CMD_DAC_SET      0x0301U
 #define SYS_CMD_AUTO_REPORT  0x0302U
 #define SYS_CMD_AUTO_STOP    0x0303U
 #define SYS_CMD_SLEEP        0x03AAU
-#define SYS_CMD_ALARM_REPORT 0x0411U
+#define SYS_CMD_ALARM_SET    0x0601U  /* 设置是否主动上报告警 */
+#define SYS_CMD_ALARM_QUERY  0x0602U  /* 查询告警记录 */
+#define SYS_CMD_ALARM_CLEAR  0x0603U  /* 清除告警记录 */
 #define SYS_CMD_BOOT_ENTER   0x0501U
 #define SYS_CMD_OTA_DATA     0x0502U
 #define SYS_CMD_OTA_DONE     0x0503U
@@ -91,15 +102,19 @@ typedef struct {
 
 typedef struct {
     uint32_t magic;          /* CONFIG_MAGIC */
-    uint32_t ratio;          /* 变比 */
+    uint32_t ratio;          /* 兼容旧字段：保留 */
     uint32_t limit;          /* 兼容旧配置：阈值/采样周期 */
     uint32_t device_id;      /* 设备ID: 0x0001~0xFFFE */
-    uint32_t ch0_limit_mv;   /* CH0阈值，单位mV */
-    uint32_t ch1_limit_mv;   /* CH1阈值，单位mV */
+    uint32_t ch0_limit_mv;   /* 兼容旧字段：保留 */
+    uint32_t ch1_limit_mv;   /* 兼容旧字段：保留 */
     uint32_t ch0_period_sec; /* CH0采集周期，单位秒 */
     uint32_t ch1_period_sec; /* CH1采集周期，单位秒 */
     uint32_t dac_value;      /* DAC输出值：0~4095 */
     uint32_t baud_code;      /* 0x11/0x12/0x13/0x14 */
+    uint32_t ch0_ratio_bits; /* CH0变比，IEEE754位模式 */
+    uint32_t ch1_ratio_bits; /* CH1变比，IEEE754位模式 */
+    uint32_t ch0_thr_bits;   /* CH0阈值，IEEE754位模式 */
+    uint32_t ch1_thr_bits;   /* CH1阈值，IEEE754位模式 */
     uint32_t crc32;          /* CRC32校验 */
 } config_data_t;
 
@@ -208,6 +223,10 @@ static uint32_t calc_crc32(const uint8_t *data, uint32_t len)
     return crc ^ 0xFFFFFFFF;
 }
 
+/* float与IEEE754位模式互转（定义见后） */
+static float bits_to_float(uint32_t bits);
+static uint32_t float_to_bits(float f);
+
 /* 从Flash读取配置 */
 static void config_default(config_data_t *cfg)
 {
@@ -222,6 +241,10 @@ static void config_default(config_data_t *cfg)
     cfg->ch1_period_sec = CONFIG_DEFAULT_PERIOD;
     cfg->dac_value = CONFIG_DEFAULT_DAC;
     cfg->baud_code = CONFIG_DEFAULT_BAUD_CODE;
+    cfg->ch0_ratio_bits = float_to_bits(CONFIG_DEFAULT_RATIO_F);
+    cfg->ch1_ratio_bits = float_to_bits(CONFIG_DEFAULT_RATIO_F);
+    cfg->ch0_thr_bits = float_to_bits(CONFIG_DEFAULT_THR_F);
+    cfg->ch1_thr_bits = float_to_bits(CONFIG_DEFAULT_THR_F);
 }
 
 static bool device_id_valid(uint32_t id)
@@ -295,6 +318,18 @@ static bool config_write(const config_data_t *cfg)
     }
     if (cfg_with_crc.baud_code == 0U) {
         cfg_with_crc.baud_code = CONFIG_DEFAULT_BAUD_CODE;
+    }
+    if (cfg_with_crc.ch0_ratio_bits == 0U) {
+        cfg_with_crc.ch0_ratio_bits = float_to_bits(CONFIG_DEFAULT_RATIO_F);
+    }
+    if (cfg_with_crc.ch1_ratio_bits == 0U) {
+        cfg_with_crc.ch1_ratio_bits = float_to_bits(CONFIG_DEFAULT_RATIO_F);
+    }
+    if (cfg_with_crc.ch0_thr_bits == 0U) {
+        cfg_with_crc.ch0_thr_bits = float_to_bits(CONFIG_DEFAULT_THR_F);
+    }
+    if (cfg_with_crc.ch1_thr_bits == 0U) {
+        cfg_with_crc.ch1_thr_bits = float_to_bits(CONFIG_DEFAULT_THR_F);
     }
     if (cfg_with_crc.dac_value > 4095U) {
         cfg_with_crc.dac_value = 4095U;
@@ -615,21 +650,42 @@ static float get_float_be(const uint8_t *in)
     return v.f;
 }
 
-static float cfg_ratio_value(void)
+static float bits_to_float(uint32_t bits)
+{
+    union { float f; uint32_t u; } v;
+    v.u = bits;
+    return v.f;
+}
+
+static uint32_t float_to_bits(float f)
+{
+    union { float f; uint32_t u; } v;
+    v.f = f;
+    return v.u;
+}
+
+static float cfg_ch0_ratio(void)
 {
     config_data_t cfg;
     config_read_or_default(&cfg);
-    return (float)cfg.ratio;
+    return bits_to_float(cfg.ch0_ratio_bits);
+}
+
+static float cfg_ch1_ratio(void)
+{
+    config_data_t cfg;
+    config_read_or_default(&cfg);
+    return bits_to_float(cfg.ch1_ratio_bits);
 }
 
 static float sys_ch0_voltage(void)
 {
-    return adc_to_voltage(adc_value[0]) * cfg_ratio_value();
+    return adc_to_voltage(adc_value[0]) * cfg_ch0_ratio();
 }
 
 static float sys_ch1_voltage(void)
 {
-    return adc_to_voltage(g_dac_val) * cfg_ratio_value();
+    return adc_to_voltage(g_dac_val) * cfg_ch1_ratio();
 }
 
 static float sys_temperature_value(void)
@@ -858,20 +914,74 @@ static uint8_t sys_process_frame(uint32_t usart, const uint8_t *data, uint16_t l
         return 1U;
     }
 
-    if(cmd == SYS_CMD_TEMP_OR_LIMIT && payload_len == 0U){
+    if(cmd == SYS_CMD_CH2_QUERY && payload_len == 0U){
         put_float_be(rsp, sys_temperature_value());
-        sys_send_frame(usart, cur_id, SYS_TYPE_RSP, SYS_CMD_TEMP_OR_LIMIT, rsp, 4U);
+        sys_send_frame(usart, cur_id, SYS_TYPE_RSP, SYS_CMD_CH2_QUERY, rsp, 4U);
         return 1U;
     }
 
+    /* 0x0241 设CH0变比 */
     if(cmd == SYS_CMD_TEMP_OR_LIMIT && payload_len == 4U){
-        float limit_v = get_float_be(payload);
-        uint32_t mv = (uint32_t)(limit_v * 1000.0f);
+        float ratio = get_float_be(payload);
         config_read_or_default(&cfg);
-        cfg.ch0_limit_mv = mv;
-        cfg.ch1_limit_mv = mv;
+        cfg.ch0_ratio_bits = float_to_bits(ratio);
         rsp[0] = config_write(&cfg) ? 0xFFU : 0xFEU;
         sys_send_frame(usart, cur_id, SYS_TYPE_RSP, SYS_CMD_TEMP_OR_LIMIT, rsp, 1U);
+        return 1U;
+    }
+
+    /* 0x0242 设CH1变比 */
+    if(cmd == SYS_CMD_CH1_RATIO_SET && payload_len == 4U){
+        float ratio = get_float_be(payload);
+        config_read_or_default(&cfg);
+        cfg.ch1_ratio_bits = float_to_bits(ratio);
+        rsp[0] = config_write(&cfg) ? 0xFFU : 0xFEU;
+        sys_send_frame(usart, cur_id, SYS_TYPE_RSP, SYS_CMD_CH1_RATIO_SET, rsp, 1U);
+        return 1U;
+    }
+
+    /* 0x0400 批量读阈值(CH0+CH1) 返回8字节 */
+    if(cmd == SYS_CMD_THR_QUERY_ALL && payload_len == 0U){
+        config_read_or_default(&cfg);
+        put_float_be(&rsp[0], bits_to_float(cfg.ch0_thr_bits));
+        put_float_be(&rsp[4], bits_to_float(cfg.ch1_thr_bits));
+        sys_send_frame(usart, cur_id, SYS_TYPE_RSP, SYS_CMD_THR_QUERY_ALL, rsp, 8U);
+        return 1U;
+    }
+
+    /* 0x0401 读CH0阈值 */
+    if(cmd == SYS_CMD_CH0_THR_QUERY && payload_len == 0U){
+        config_read_or_default(&cfg);
+        put_float_be(rsp, bits_to_float(cfg.ch0_thr_bits));
+        sys_send_frame(usart, cur_id, SYS_TYPE_RSP, SYS_CMD_CH0_THR_QUERY, rsp, 4U);
+        return 1U;
+    }
+
+    /* 0x0402 读CH1阈值 */
+    if(cmd == SYS_CMD_CH1_THR_QUERY && payload_len == 0U){
+        config_read_or_default(&cfg);
+        put_float_be(rsp, bits_to_float(cfg.ch1_thr_bits));
+        sys_send_frame(usart, cur_id, SYS_TYPE_RSP, SYS_CMD_CH1_THR_QUERY, rsp, 4U);
+        return 1U;
+    }
+
+    /* 0x0411 写CH0阈值 */
+    if(cmd == SYS_CMD_CH0_THR_SET && payload_len == 4U){
+        float thr = get_float_be(payload);
+        config_read_or_default(&cfg);
+        cfg.ch0_thr_bits = float_to_bits(thr);
+        rsp[0] = config_write(&cfg) ? 0xFFU : 0xFEU;
+        sys_send_frame(usart, cur_id, SYS_TYPE_RSP, SYS_CMD_CH0_THR_SET, rsp, 1U);
+        return 1U;
+    }
+
+    /* 0x0412 写CH1阈值 */
+    if(cmd == SYS_CMD_CH1_THR_SET && payload_len == 4U){
+        float thr = get_float_be(payload);
+        config_read_or_default(&cfg);
+        cfg.ch1_thr_bits = float_to_bits(thr);
+        rsp[0] = config_write(&cfg) ? 0xFFU : 0xFEU;
+        sys_send_frame(usart, cur_id, SYS_TYPE_RSP, SYS_CMD_CH1_THR_SET, rsp, 1U);
         return 1U;
     }
 
@@ -1007,20 +1117,21 @@ static void sampling_process(void)
     ch1 = sys_ch1_voltage();
     dev_id = sys_device_id_get();
 
-    if(ch0 > ((float)cfg.ch0_limit_mv / 1000.0f)){
+    if(ch0 > bits_to_float(cfg.ch0_thr_bits)){
         new_alarm_state |= 0x01U;
     }
-    if(ch1 > ((float)cfg.ch1_limit_mv / 1000.0f)){
+    if(ch1 > bits_to_float(cfg.ch1_thr_bits)){
         new_alarm_state |= 0x02U;
     }
 
     if((new_alarm_state & 0x01U) != (alarm_state & 0x01U)){
-        put_float_be(alarm_payload, ch0);
-        sys_send_frame(USART1, dev_id, SYS_TYPE_RSP, SYS_CMD_ALARM_REPORT, alarm_payload, 4U);
+        /* 告警上报：ASCII字符串直接回复（非帧封装），I阶段完善 */
+        my_printf(USART1, "ALARM CH0 thr=%.2f val=%.2f\r\n",
+                  bits_to_float(cfg.ch0_thr_bits), ch0);
     }
     if((new_alarm_state & 0x02U) != (alarm_state & 0x02U)){
-        put_float_be(alarm_payload, ch1);
-        sys_send_frame(USART1, dev_id, SYS_TYPE_RSP, SYS_CMD_ALARM_REPORT, alarm_payload, 4U);
+        my_printf(USART1, "ALARM CH1 thr=%.2f val=%.2f\r\n",
+                  bits_to_float(cfg.ch1_thr_bits), ch1);
     }
     alarm_state = new_alarm_state;
 
