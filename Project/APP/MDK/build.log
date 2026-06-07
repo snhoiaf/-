@@ -1,18 +1,18 @@
 *** Using Compiler 'V6.16', folder: 'C:\keil5\ARM\ARMCLANG\Bin'
 Build target 'McuSTUDIO_F470VET6'
-compiling mcu_cmic_gd32f470vet6.c...
+compiling usart_app.c...
 linking...
-Program Size: Code=46288 RO-data=4668 RW-data=48 ZI-data=34944  
+Program Size: Code=47204 RO-data=4668 RW-data=52 ZI-data=34948  
 FromELF: creating hex file...
 After Build - User command #1: ./keil5_disp_size_bar.exe
 ram:
   RW_IRAM1 :0x20000000
-  128.00 KB :|¡ö¡ö¡ö¡ö¡ö_______________|   26.70 % (   34.17 KB /   128.00 KB) [96080 B]
-  ER_IRAM_FUNC :0x200088b0
+  128.00 KB :|¡ö¡ö¡ö¡ö¡ö_______________|   26.70 % (   34.18 KB /   128.00 KB) [96072 B]
+  ER_IRAM_FUNC :0x200088b8
   192.00 KB :|____________________|    0.36 % (    0.69 KB /   192.00 KB) [195904 B]
 flash:
   ER_IROM1 :0x8011000
-  128.00 KB :|¡ö¡ö¡ö¡ö¡ö¡ö¡ö_____________|   38.34 % (   49.07 KB /   128.00 KB) [80820 B]
+  128.00 KB :|¡ö¡ö¡ö¡ö¡ö¡ö¡ö_____________|   39.04 % (   49.97 KB /   128.00 KB) [79904 B]
 After Build - User command #2: fromelf --bin --output=.\output\App.bin .\output\Project.axf
 ".\output\Project.axf" - 0 Error(s), 0 Warning(s).
-Build Time Elapsed:  00:00:04
+Build Time Elapsed:  00:00:07

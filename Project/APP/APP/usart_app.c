@@ -881,6 +881,15 @@ static uint8_t sys_process_frame(uint32_t usart, const uint8_t *data, uint16_t l
     type = raw[4];
     payload = &raw[9];
 
+    /* 处理心跳帧（0x05类型，0xFFFF命令） */
+    if(type == SYS_TYPE_RESET && cmd == 0xFFFFU){
+        /* 响应心跳，返回设备ID */
+        rsp[0] = (uint8_t)(cur_id >> 8);
+        rsp[1] = (uint8_t)cur_id;
+        sys_send_frame(usart, cur_id, SYS_TYPE_RESET, 0xFFFFU, rsp, 2U);
+        return 1U;
+    }
+
     if(type != SYS_TYPE_REQ || (dev_id != cur_id && dev_id != DEVICE_ID_BROADCAST)){
         return 1U;
     }

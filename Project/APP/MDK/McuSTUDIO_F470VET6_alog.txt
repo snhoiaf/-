@@ -6,25 +6,25 @@
 [Found keyword]: ----------Execution Region----------
 [name]:  ER_IROM1 
 [Exec base]: 0x8011000
-[Size]: 0xc44c
+[Size]: 0xc7e0
 [Max]: 0x20000
 [Found keyword]: ----------Execution Region----------
 [name]:  RW_IRAM1 
 [Exec base]: 0x20000000
-[Size]: 0x88b0
+[Size]: 0x88b8
 [Max]: 0x20000
 [Found keyword]: ----------Execution Region----------
 [name]:  ER_IRAM_FUNC 
-[Exec base]: 0x200088b0
+[Exec base]: 0x200088b8
 [Size]: 0x2c0
 [Max]: 0xffffffff
 [parse_keil_map over printf bar]: 
   RW_IRAM1 :0x20000000
-  128.00 KB :|¡ö¡ö¡ö¡ö¡ö_______________|   26.70 % (   34.17 KB /   128.00 KB) [96080 B]
-  ER_IRAM_FUNC :0x200088b0
+  128.00 KB :|¡ö¡ö¡ö¡ö¡ö_______________|   26.70 % (   34.18 KB /   128.00 KB) [96072 B]
+  ER_IRAM_FUNC :0x200088b8
   192.00 KB :|____________________|    0.36 % (    0.69 KB /   192.00 KB) [195904 B]
   ER_IROM1 :0x8011000
-  128.00 KB :|¡ö¡ö¡ö¡ö¡ö¡ö¡ö_____________|   38.34 % (   49.07 KB /   128.00 KB) [80820 B]
+  128.00 KB :|¡ö¡ö¡ö¡ö¡ö¡ö¡ö_____________|   39.04 % (   49.97 KB /   128.00 KB) [79904 B]
 [export csv]: ./McuSTUDIO_F470VET6_sort_by_flash.csv
 [export csv]: ./McuSTUDIO_F470VET6_sort_by_ram.csv
 [export xlsx]: McuSTUDIO_F470VET6_analysis.xlsx
