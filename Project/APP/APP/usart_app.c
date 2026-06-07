@@ -26,7 +26,7 @@ extern uint16_t convertarr[CONVERT_NUM];
 #define CONFIG_DEFAULT_THRESHOLD  2500UL
 #define CONFIG_DEFAULT_PERIOD     5UL
 #define CONFIG_DEFAULT_DAC        0UL
-#define CONFIG_DEFAULT_BAUD_CODE  0x14U
+#define CONFIG_DEFAULT_BAUD_CODE  0x13U
 
 #define DEVICE_ID_DEFAULT    0x0001U
 #define DEVICE_ID_MIN        0x0001U
@@ -62,6 +62,7 @@ extern uint16_t convertarr[CONVERT_NUM];
 #define SYS_CMD_PERIOD_SET   0x0261U
 #define SYS_CMD_DAC_SET      0x0301U
 #define SYS_CMD_AUTO_REPORT  0x0302U
+#define SYS_CMD_AUTO_STOP    0x0303U
 #define SYS_CMD_SLEEP        0x03AAU
 #define SYS_CMD_ALARM_REPORT 0x0411U
 #define SYS_CMD_BOOT_ENTER   0x0501U
@@ -676,8 +677,8 @@ static void sys_send_frame(uint32_t usart, uint16_t dev_id, uint8_t type,
     }
 
     crc = sys_crc16(raw, pos);
-    raw[pos++] = (uint8_t)crc;
     raw[pos++] = (uint8_t)(crc >> 8);
+    raw[pos++] = (uint8_t)crc;
     raw[pos++] = SYS_TAIL_HI;
     raw[pos++] = SYS_TAIL_LO;
 
@@ -687,7 +688,7 @@ static void sys_send_frame(uint32_t usart, uint16_t dev_id, uint8_t type,
             n += snprintf(&out[n], sizeof(out) - n, "%02X", payload[i]);
         }
     }
-    snprintf(&out[n], sizeof(out) - n, "%02X%02XB6A5\r\n", (uint8_t)crc, (uint8_t)(crc >> 8));
+    snprintf(&out[n], sizeof(out) - n, "%04XB6A5\r\n", crc);
     my_printf(usart, "%s", out);
 }
 
@@ -735,7 +736,7 @@ static uint8_t sys_process_frame(uint32_t usart, const uint8_t *data, uint16_t l
         return 1U;
     }
 
-    crc_rx = ((uint16_t)raw[raw_len - 3U] << 8) | raw[raw_len - 4U];
+    crc_rx = ((uint16_t)raw[raw_len - 4U] << 8) | raw[raw_len - 3U];
     crc_calc = sys_crc16(raw, raw_len - 4U);
     if(crc_rx != crc_calc){
         sys_send_error(usart, cur_id);
@@ -746,6 +747,33 @@ static uint8_t sys_process_frame(uint32_t usart, const uint8_t *data, uint16_t l
     payload = &raw[9];
 
     if(type != SYS_TYPE_REQ || (dev_id != cur_id && dev_id != DEVICE_ID_BROADCAST)){
+        return 1U;
+    }
+
+    /* 自动上报期间：除停止上报(0x0303)外，其他命令一律不响应(H-02) */
+    if(sampling_active && cmd != SYS_CMD_AUTO_STOP){
+        return 1U;
+    }
+
+    /* 开始定时自动上报(0x0302)：首次立即回一帧，之后由sampling_process按间隔发送 */
+    if(cmd == SYS_CMD_AUTO_REPORT && payload_len == 0U){
+        uint8_t rep[12];
+        float ch0v = sys_ch0_voltage();
+        float ch1v = sys_ch1_voltage();
+        put_u32_be(rep, rtc_to_unix());
+        put_float_be(&rep[4], ch0v);
+        put_float_be(&rep[8], ch1v);
+        sys_send_frame(usart, cur_id, SYS_TYPE_RSP, SYS_CMD_AUTO_REPORT, rep, 12U);
+        sampling_active = 1U;
+        sampling_last_time = get_system_ms();
+        return 1U;
+    }
+
+    /* 停止定时自动上报(0x0303)：回OK并停止 */
+    if(cmd == SYS_CMD_AUTO_STOP && payload_len == 0U){
+        sampling_active = 0U;
+        rsp[0] = 0xFFU;
+        sys_send_frame(usart, cur_id, SYS_TYPE_RSP, SYS_CMD_AUTO_STOP, rsp, 1U);
         return 1U;
     }
 
@@ -1200,6 +1228,12 @@ void uart_task(void)
 
     if(!cfg_applied){
         sys_apply_persistent_config();
+        /* 上电心跳帧，通知上位机设备已就绪 */
+        {
+            config_data_t hb_cfg;
+            config_read_or_default(&hb_cfg);
+            sys_send_frame(USART1, (uint16_t)hb_cfg.device_id, SYS_TYPE_RESET, 0x8888U, NULL, 0U);
+        }
         cfg_applied = 1U;
     }
 

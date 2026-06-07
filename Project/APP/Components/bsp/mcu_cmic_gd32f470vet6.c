@@ -166,7 +166,7 @@ void bsp_usart1_init(void)
     gpio_output_options_set(USART1_TX_PORT, GPIO_OTYPE_PP, GPIO_OSPEED_50MHZ, USART1_TX_PIN|USART1_RX_PIN);
 
     usart_deinit(USART1);
-    usart_baudrate_set(USART1, 115200U);
+    usart_baudrate_set(USART1, 19200U);
     usart_receive_config(USART1, USART_RECEIVE_ENABLE);
     usart_transmit_config(USART1, USART_TRANSMIT_ENABLE);
     usart_dma_receive_config(USART1, USART_RECEIVE_DMA_ENABLE);

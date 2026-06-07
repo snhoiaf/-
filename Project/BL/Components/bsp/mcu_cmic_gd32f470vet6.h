@@ -58,6 +58,13 @@ extern "C" {
 #define USART0_RX_DMA_CHANNEL     DMA_CH5
 #define USART0_RX_DMA_SUBPERI     DMA_SUBPERI4
 
+/* USART1 DMA配置 (DMA0 CH5 SUB4) */
+#define USART1_RX_DMA_PERIPH      DMA0
+#define USART1_RX_DMA_CHANNEL     DMA_CH5
+#define USART1_RX_DMA_SUBPERI     DMA_SUBPERI4
+#define USART1_RDATA_ADDRESS      ((uint32_t)&USART_DATA(USART1))
+#define USART1_RX_BUF_SIZE        2048U
+
 /* 串口端口别名 */
 #define USART0_PORT               USART0_TX_PORT
 #define USART0_CLK_PORT           RCU_GPIOA

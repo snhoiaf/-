@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(grep -v \"^.*//\\\\|bl_crc16\\\\|bl_crc32\")",
+      "Bash(sed -n '211,230p' \"D:\\\\Desktop\\\\V2BL - 原本\\\\Project\\\\APP\\\\APP\\\\usart_app.c\")",
+      "Bash(sed -n '471,490p' \"D:\\\\Desktop\\\\V2BL - 原本\\\\Project\\\\APP\\\\APP\\\\usart_app.c\")",
+      "Bash(sed -n '570,595p' \"D:\\\\Desktop\\\\V2BL - 原本\\\\Project\\\\APP\\\\APP\\\\usart_app.c\")",
+      "Bash(python3)",
+      "Bash(python3 -c \"print\\('0501:', 'A5B6000101050100022 5AAB6A5'.replace\\(' ',''\\)\\)\")",
+      "Bash(python3 -c \"print\\('0502:', 'A5B6000101050200 02255AB6A5'.replace\\(' ',''\\)\\)\")",
+      "Bash(python3 -c ' *)",
+      "Bash(git add *)",
+      "Bash(git commit -m ' *)"
+    ]
+  }
+}

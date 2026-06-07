@@ -6,6 +6,8 @@
 
 /* USART0 DMA接收缓冲区 */
 uint8_t dbg_rx_buf[512];
+/* USART1 DMA接收缓冲区 */
+uint8_t usart1_rx_buf[USART1_RX_BUF_SIZE];
 uint8_t oled_cmd_buf[2]  = {0x00, 0x00};
 uint8_t oled_data_buf[2] = {0x40, 0x00};
 
@@ -111,31 +113,49 @@ void bsp_oled_init(void)
 
 /*
  * USART1初始化配置
- * RS485扩展串口，波特率115200，PE8方向控制
+ * RS485扩展串口，波特率19200，PE8方向控制，DMA接收，空闲中断
  */
 void bsp_usart1_init(void)
 {
+    dma_single_data_parameter_struct dma_cfg;
+
+    rcu_periph_clock_enable(RCU_DMA0);
     rcu_periph_clock_enable(RCU_GPIOD);
     rcu_periph_clock_enable(RCU_GPIOE);
     rcu_periph_clock_enable(RCU_USART1);
 
-    gpio_af_set(USART1_TX_PORT, AF_USART1, USART1_TX_PIN);
-    gpio_af_set(USART1_RX_PORT, AF_USART1, USART1_RX_PIN);
-
-    gpio_mode_set(USART1_TX_PORT, GPIO_MODE_AF, GPIO_PUPD_PULLUP, USART1_TX_PIN);
-    gpio_output_options_set(USART1_TX_PORT, GPIO_OTYPE_PP, GPIO_OSPEED_50MHZ, USART1_TX_PIN);
-    gpio_mode_set(USART1_RX_PORT, GPIO_MODE_AF, GPIO_PUPD_PULLUP, USART1_RX_PIN);
-    gpio_output_options_set(USART1_RX_PORT, GPIO_OTYPE_PP, GPIO_OSPEED_50MHZ, USART1_RX_PIN);
+    gpio_af_set(USART1_TX_PORT, AF_USART1, USART1_TX_PIN | USART1_RX_PIN);
+    gpio_mode_set(USART1_TX_PORT, GPIO_MODE_AF, GPIO_PUPD_PULLUP, USART1_TX_PIN | USART1_RX_PIN);
+    gpio_output_options_set(USART1_TX_PORT, GPIO_OTYPE_PP, GPIO_OSPEED_50MHZ, USART1_TX_PIN | USART1_RX_PIN);
 
     gpio_mode_set(USART1_DIR_PORT, GPIO_MODE_OUTPUT, GPIO_PUPD_NONE, USART1_DIR_PIN);
     gpio_output_options_set(USART1_DIR_PORT, GPIO_OTYPE_PP, GPIO_OSPEED_50MHZ, USART1_DIR_PIN);
     gpio_bit_reset(USART1_DIR_PORT, USART1_DIR_PIN);
 
+    /* DMA接收配置 */
+    dma_deinit(USART1_RX_DMA_PERIPH, USART1_RX_DMA_CHANNEL);
+    dma_cfg.direction = DMA_PERIPH_TO_MEMORY;
+    dma_cfg.memory0_addr = (uint32_t)usart1_rx_buf;
+    dma_cfg.memory_inc = DMA_MEMORY_INCREASE_ENABLE;
+    dma_cfg.number = USART1_RX_BUF_SIZE;
+    dma_cfg.periph_addr = USART1_RDATA_ADDRESS;
+    dma_cfg.periph_inc = DMA_PERIPH_INCREASE_DISABLE;
+    dma_cfg.periph_memory_width = DMA_PERIPH_WIDTH_8BIT;
+    dma_cfg.priority = DMA_PRIORITY_HIGH;
+    dma_single_data_mode_init(USART1_RX_DMA_PERIPH, USART1_RX_DMA_CHANNEL, &dma_cfg);
+    dma_circulation_disable(USART1_RX_DMA_PERIPH, USART1_RX_DMA_CHANNEL);
+    dma_channel_subperipheral_select(USART1_RX_DMA_PERIPH, USART1_RX_DMA_CHANNEL, USART1_RX_DMA_SUBPERI);
+    dma_channel_enable(USART1_RX_DMA_PERIPH, USART1_RX_DMA_CHANNEL);
+
     usart_deinit(USART1);
-    usart_baudrate_set(USART1, 115200U);
+    usart_baudrate_set(USART1, 19200U);
     usart_receive_config(USART1, USART_RECEIVE_ENABLE);
     usart_transmit_config(USART1, USART_TRANSMIT_ENABLE);
+    usart_dma_receive_config(USART1, USART_RECEIVE_DMA_ENABLE);
     usart_enable(USART1);
+
+    nvic_irq_enable(USART1_IRQn, 0, 1);
+    usart_interrupt_enable(USART1, USART_INT_IDLE);
 }
 
 void bsp_usart_init(void)

@@ -11,6 +11,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <string.h>
+#include <stdio.h>
 #include "gd32f4xx.h"
 #include "bl_core.h"
 #include "bl_config.h"
@@ -268,17 +269,307 @@ static uint8_t boot_request_take(void)
     return requested;
 }
 
-static void bootloader_wait_cmd(void)
+/* ---- 协议帧相关 ---- */
+
+/* 外部变量：来自gd32f4xx_it.c */
+extern volatile uint32_t usart1_rx_len;
+extern volatile uint8_t  usart1_rx_flag;
+extern uint8_t usart1_rx_buf[USART1_RX_BUF_SIZE];
+
+#define PROTO_HEAD_HI   0xA5U
+#define PROTO_HEAD_LO   0xB6U
+#define PROTO_TAIL_HI   0xB6U
+#define PROTO_TAIL_LO   0xA5U
+#define PROTO_TYPE_RSP  0x02U
+#define PROTO_TYPE_ERR  0xFFU
+#define PROTO_CMD_0502  0x0502U
+#define PROTO_CMD_0503  0x0503U
+#define PROTO_CMD_EEEE  0xEEEEU
+#define FIRMWARE_MAGIC  0x5AA5C33CUL
+#define OTA_CHUNK_SIZE  256U
+
+static uint16_t bl_crc16(const uint8_t *data, uint16_t len)
 {
-    my_printf(USART1, "using command to interrupt start Application\r\n");
-    my_printf(USART1, "wait for start Application(10s)......\r\n");
-    delay_1ms(3000);
-    my_printf(USART1, "wait for start Application(7s)......\r\n");
-    delay_1ms(3000);
-    my_printf(USART1, "wait for start Application(4s)......\r\n");
-    delay_1ms(3000);
-    my_printf(USART1, "wait for start Application(1s)......\r\n");
-    delay_1ms(1000);
+    uint16_t crc = 0xFFFFU;
+    uint16_t i;
+    uint8_t  bit;
+    for(i = 0; i < len; i++){
+        crc ^= data[i];
+        for(bit = 0; bit < 8U; bit++){
+            if(crc & 0x0001U) crc = (uint16_t)((crc >> 1) ^ 0xA001U);
+            else crc >>= 1;
+        }
+    }
+    return crc;
+}
+
+/* ASCII HEX字符串 → 二进制，返回转换字节数 */
+static uint32_t ascii_hex_to_bin(const uint8_t *src, uint32_t src_len, uint8_t *dst, uint32_t dst_max)
+{
+    uint32_t i, out = 0;
+    uint8_t hi, lo, h, l;
+    for(i = 0; i + 1 < src_len && out < dst_max; i += 2){
+        h = src[i];     lo = src[i+1];
+        hi = (h  >= 'A') ? (h  - 'A' + 10U) : (h  >= 'a') ? (h  - 'a' + 10U) : (h  - '0');
+        l  = (lo >= 'A') ? (lo - 'A' + 10U) : (lo >= 'a') ? (lo - 'a' + 10U) : (lo - '0');
+        dst[out++] = (uint8_t)((hi << 4) | l);
+    }
+    return out;
+}
+
+/* 发送RS485帧（ASCII HEX格式） */
+static void bl_send_frame(uint16_t dev_id, uint8_t type, uint16_t cmd,
+                           const uint8_t *payload, uint8_t plen)
+{
+    uint8_t  raw[16];
+    uint32_t pos = 0;
+    uint16_t crc;
+    char     out[64];
+    int      n, i;
+
+    raw[pos++] = PROTO_HEAD_HI;
+    raw[pos++] = PROTO_HEAD_LO;
+    raw[pos++] = (uint8_t)(dev_id >> 8);
+    raw[pos++] = (uint8_t)(dev_id);
+    raw[pos++] = type;
+    raw[pos++] = (uint8_t)(cmd >> 8);
+    raw[pos++] = (uint8_t)(cmd);
+    raw[pos++] = plen;
+    raw[pos++] = 0x02U;
+    for(i = 0; i < plen && pos < sizeof(raw); i++) raw[pos++] = payload[i];
+
+    crc = bl_crc16(raw, (uint16_t)pos);
+
+    n = snprintf(out, sizeof(out), "A5B6%04X%02X%04X%02X02",
+                 dev_id, type, cmd, plen);
+    for(i = 0; i < plen; i++) n += snprintf(out + n, sizeof(out) - (size_t)n, "%02X", payload[i]);
+    n += snprintf(out + n, sizeof(out) - (size_t)n, "%04X", crc);
+    n += snprintf(out + n, sizeof(out) - (size_t)n, "B6A5");
+
+    gpio_bit_set(USART1_DIR_PORT, USART1_DIR_PIN);
+    usart_interrupt_disable(USART1, USART_INT_IDLE);
+    delay_1ms(1);
+    for(i = 0; i < n; i++){
+        usart_data_transmit(USART1, (uint8_t)out[i]);
+        while(RESET == usart_flag_get(USART1, USART_FLAG_TBE));
+    }
+    while(RESET == usart_flag_get(USART1, USART_FLAG_TC));
+    delay_1ms(1);
+    gpio_bit_reset(USART1_DIR_PORT, USART1_DIR_PIN);
+    usart_data_receive(USART1);
+    usart_interrupt_flag_clear(USART1, USART_INT_FLAG_IDLE);
+    usart_interrupt_enable(USART1, USART_INT_IDLE);
+}
+
+static void bl_send_ok(uint16_t dev_id, uint16_t cmd)
+{
+    uint8_t rsp = 0xFFU;
+    bl_send_frame(dev_id, PROTO_TYPE_RSP, cmd, &rsp, 1U);
+}
+
+static void bl_send_err(uint16_t dev_id)
+{
+    bl_send_frame(dev_id, PROTO_TYPE_ERR, PROTO_CMD_EEEE, NULL, 0U);
+}
+
+/*
+ * 从ASCII HEX帧缓冲中解析命令字，返回cmd；失败返回0
+ * 格式: A5B6 XXXX XX XXXX XX XX [payload] XXXX B6A5
+ * 按字节位置: [0-3]head [4-7]id [8-9]type [10-13]cmd [14-15]len [16-17]ver ...
+ */
+static uint16_t bl_parse_cmd(const uint8_t *buf, uint32_t len, uint16_t *out_dev_id)
+{
+    uint8_t  raw[32];
+    uint32_t raw_len, total_chars;
+    uint16_t cmd, dev_id, crc_rx, crc_calc;
+    uint8_t  payload_len;
+
+    /* 去掉末尾\r\n等空白 */
+    while(len > 0U && (buf[len-1U] == '\r' || buf[len-1U] == '\n' || buf[len-1U] == 0x00U)){
+        len--;
+    }
+
+    /* 最小帧22字符 */
+    if(len < 22U) return 0U;
+    if(buf[0]!='A'||buf[1]!='5'||buf[2]!='B'||buf[3]!='6') return 0U;
+    if(buf[len-4]!='B'||buf[len-3]!='6'||buf[len-2]!='A'||buf[len-1]!='5') return 0U;
+
+    raw_len = ascii_hex_to_bin(buf, len - 4U, raw, sizeof(raw));
+    if(raw_len < 9U) return 0U;
+
+    dev_id      = (uint16_t)((raw[2] << 8) | raw[3]);
+    payload_len =  raw[7];
+    total_chars = 4U + (uint32_t)(9U + payload_len + 2U) * 2U + 4U;
+    if(len < total_chars) return 0U;
+
+    crc_rx   = (uint16_t)((raw[raw_len - 2U] << 8) | raw[raw_len - 1U]);
+    crc_calc = bl_crc16(raw, (uint16_t)(raw_len - 2U));
+    if(crc_rx != crc_calc) return 0U;
+
+    cmd = (uint16_t)((raw[5] << 8) | raw[6]);
+    if(out_dev_id) *out_dev_id = dev_id;
+    return cmd;
+}
+
+/*
+ * 等待并接收OTA固件包（裸bin，256字节切片，5ms间隔）
+ * 写入固件暂存区BL_APP2_START_ADDR，校验magic后提交参数页
+ * 返回实际接收字节数，失败返回0
+ */
+static uint32_t bl_recv_firmware(uint16_t dev_id, bl_param_t *work)
+{
+    uint32_t total = 0U;
+    uint32_t chunk_len;
+    uint32_t erase_done = 0U;
+    uint32_t timeout;
+
+    /* 擦除固件暂存区 */
+    if(!fl_erase(BL_APP2_START_ADDR, BL_APP2_SIZE)) return 0U;
+    erase_done = 1U;
+    (void)erase_done;
+
+    /* 按切片接收，每片最多256字节，超时50ms无数据则认为结束 */
+    while(total < BL_APP2_SIZE){
+        timeout = 200U; /* 200×1ms = 200ms超时 */
+        while(!usart1_rx_flag && timeout) { delay_1ms(1); timeout--; }
+        if(!usart1_rx_flag) break;
+
+        chunk_len = usart1_rx_len;
+        if(total + chunk_len > BL_APP2_SIZE) chunk_len = BL_APP2_SIZE - total;
+
+        if(!fl_write(BL_APP2_START_ADDR + total, usart1_rx_buf, chunk_len)){
+            return 0U;
+        }
+        total += chunk_len;
+        usart1_rx_flag = 0U;
+        usart1_rx_len  = 0U;
+
+        /* 重置DMA继续接收 */
+        dma_channel_disable(USART1_RX_DMA_PERIPH, USART1_RX_DMA_CHANNEL);
+        dma_flag_clear(USART1_RX_DMA_PERIPH, USART1_RX_DMA_CHANNEL, DMA_FLAG_FTF);
+        dma_transfer_number_config(USART1_RX_DMA_PERIPH, USART1_RX_DMA_CHANNEL, USART1_RX_BUF_SIZE);
+        dma_channel_enable(USART1_RX_DMA_PERIPH, USART1_RX_DMA_CHANNEL);
+    }
+
+    if(total < 4U) return 0U;
+
+    /* 校验固件magic（前4字节） */
+    uint32_t magic;
+    memcpy(&magic, (void*)BL_APP2_START_ADDR, 4U);
+    if(magic != FIRMWARE_MAGIC) return 0U;
+
+    /* 剥离magic，实际App从第5字节开始，大小=total-4 */
+    uint32_t app_size = total - 4U;
+    if(app_size == 0U || app_size > BL_APP2_SIZE) return 0U;
+
+    /* 把App内容向前移4字节（擦除后重写） */
+    static uint8_t tmp_page[BL_FLASH_PAGE_SIZE];
+    uint32_t done = 0U, chunk;
+    fl_erase(BL_APP2_START_ADDR, (app_size + BL_FLASH_PAGE_SIZE - 1U) & ~(BL_FLASH_PAGE_SIZE - 1U));
+    while(done < app_size){
+        chunk = app_size - done;
+        if(chunk > sizeof(tmp_page)) chunk = sizeof(tmp_page);
+        /* 从Flash+4偏移读（已写入的原始数据） */
+        memcpy(tmp_page, (void*)(BL_APP2_START_ADDR + 4U + done), chunk);
+        fl_write(BL_APP2_START_ADDR + done, tmp_page, chunk);
+        done += chunk;
+    }
+
+    /* 提交参数页PENDING */
+    work->update_flag = BL_UPDATE_FLAG_PENDING;
+    work->app_size    = app_size;
+    work->app_crc32   = bl_crc((const uint8_t*)BL_APP2_START_ADDR, app_size);
+    work->app1_addr   = BL_APP1_START_ADDR;
+    work->app2_addr   = BL_APP2_START_ADDR;
+
+    return app_size;
+}
+
+/* BL专用：发字符串，切RS485方向，发完立即释放，发送期间禁用空闲中断防回声 */
+static void bl_puts(const char *s)
+{
+    usart_interrupt_disable(USART1, USART_INT_IDLE);
+    gpio_bit_set(USART1_DIR_PORT, USART1_DIR_PIN);
+    while(*s){
+        usart_data_transmit(USART1, (uint8_t)*s);
+        while(RESET == usart_flag_get(USART1, USART_FLAG_TBE));
+        s++;
+    }
+    while(RESET == usart_flag_get(USART1, USART_FLAG_TC));
+    gpio_bit_reset(USART1_DIR_PORT, USART1_DIR_PIN);
+    /* 清除IDLE标志，重置DMA，清空buf和flag */
+    usart_data_receive(USART1);
+    usart_interrupt_flag_clear(USART1, USART_INT_FLAG_IDLE);
+    dma_channel_disable(USART1_RX_DMA_PERIPH, USART1_RX_DMA_CHANNEL);
+    dma_flag_clear(USART1_RX_DMA_PERIPH, USART1_RX_DMA_CHANNEL, DMA_FLAG_FTF);
+    memset(usart1_rx_buf, 0, USART1_RX_BUF_SIZE);
+    dma_transfer_number_config(USART1_RX_DMA_PERIPH, USART1_RX_DMA_CHANNEL, USART1_RX_BUF_SIZE);
+    dma_channel_enable(USART1_RX_DMA_PERIPH, USART1_RX_DMA_CHANNEL);
+    usart1_rx_flag = 0U;
+    usart1_rx_len  = 0U;
+    usart_interrupt_enable(USART1, USART_INT_IDLE);
+}
+
+static void bootloader_wait_cmd(bl_param_t *work)
+{
+    uint16_t cmd, dev_id = 0x0001U;
+    uint32_t app_size;
+    uint8_t  rsp;
+    uint32_t tick;
+    uint32_t total_ticks = 1000U; /* 10s × 100次/s */
+    uint32_t last_sec = 0xFFFFU;
+    uint32_t cur_sec;
+
+    bl_puts("using command to interrupt start Application\r\n");
+    bl_send_frame(dev_id, 0x05U, 0x8888U, NULL, 0U);
+
+    for(tick = 0; tick < total_ticks; tick++){
+        cur_sec = 10U - tick / 100U;
+        if(cur_sec != last_sec){
+            last_sec = cur_sec;
+            char tmp[64];
+            snprintf(tmp, sizeof(tmp), "wait for start Application(%us)......\r\n", (unsigned)cur_sec);
+            bl_puts(tmp);
+            /* bl_puts内部已清空flag和DMA */
+        }
+
+        delay_1ms(10);
+
+        if(usart1_rx_flag){
+            cmd = bl_parse_cmd(usart1_rx_buf, usart1_rx_len, &dev_id);
+            usart1_rx_flag = 0U;
+            usart1_rx_len  = 0U;
+
+            if(cmd == PROTO_CMD_0502){
+                bl_send_ok(dev_id, PROTO_CMD_0502);
+                app_size = bl_recv_firmware(dev_id, work);
+
+                if(app_size > 0U){
+                    rsp = 0xFFU;
+                    bl_send_frame(dev_id, PROTO_TYPE_RSP, PROTO_CMD_0502, &rsp, 1U);
+
+                    uint32_t t = 5000U;
+                    while(t--){
+                        delay_1ms(1);
+                        if(usart1_rx_flag){
+                            cmd = bl_parse_cmd(usart1_rx_buf, usart1_rx_len, NULL);
+                            usart1_rx_flag = 0U;
+                            usart1_rx_len  = 0U;
+                            if(cmd == PROTO_CMD_0503){
+                                bl_send_ok(dev_id, PROTO_CMD_0503);
+                                delay_1ms(50);
+                                p_commit(work, NULL, 0);
+                                NVIC_SystemReset();
+                            }
+                        }
+                    }
+                } else {
+                    bl_send_err(dev_id);
+                }
+                return;
+            }
+        }
+    }
 }
 
 /* ---- 主流程 ---- */
@@ -380,8 +671,7 @@ void bootloader_run(void)
     /* 正常启动 */
     if(app_vec_ok(BL_APP1_START_ADDR)){
         if(wait_upgrade){
-            bootloader_wait_cmd();
-            delay_1ms(5000);
+            bootloader_wait_cmd(&work);
         } else {
             delay_1ms(5000);
         }

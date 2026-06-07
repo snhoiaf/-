@@ -42,6 +42,10 @@ extern uint8_t dbg_rx_buf[512];
 extern uint8_t rx_frame_buf[256];
 extern uint8_t uart_rx_ready;
 
+extern uint8_t usart1_rx_buf[USART1_RX_BUF_SIZE];
+volatile uint32_t usart1_rx_len = 0;
+volatile uint8_t  usart1_rx_flag = 0;
+
 /*!
     \brief      this function handles NMI exception
     \param[in]  none
@@ -176,6 +180,25 @@ void USART0_IRQHandler(void)
 
 void SDIO_IRQHandler(void)
 {
+}
+
+void USART1_IRQHandler(void)
+{
+    if(RESET != usart_interrupt_flag_get(USART1, USART_INT_FLAG_IDLE)){
+        usart_data_receive(USART1);
+        dma_channel_disable(USART1_RX_DMA_PERIPH, USART1_RX_DMA_CHANNEL);
+
+        usart1_rx_len = USART1_RX_BUF_SIZE
+                        - dma_transfer_number_get(USART1_RX_DMA_PERIPH, USART1_RX_DMA_CHANNEL);
+
+        if(usart1_rx_len > 0U){
+            usart1_rx_flag = 1U;  /* 始终覆盖，保持最新帧 */
+        }
+
+        dma_flag_clear(USART1_RX_DMA_PERIPH, USART1_RX_DMA_CHANNEL, DMA_FLAG_FTF);
+        dma_transfer_number_config(USART1_RX_DMA_PERIPH, USART1_RX_DMA_CHANNEL, USART1_RX_BUF_SIZE);
+        dma_channel_enable(USART1_RX_DMA_PERIPH, USART1_RX_DMA_CHANNEL);
+    }
 }
 
 /*!
