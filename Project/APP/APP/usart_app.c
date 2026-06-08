@@ -772,23 +772,9 @@ static float sys_temperature_value(void)
 {
     int32_t raw_sum = 0;
     float raw;
-    static const struct {
-        float raw;
-        float temp;
-    } cal[] = {
-        {3478.0000f, -49.27f},
-        {3481.0000f, -44.49f},
-        {3490.1250f,   0.00f},
-        {3497.8750f,  20.00f},
-        {3500.7500f,  33.44f},
-        {3502.3750f,  38.61f},
-        {3502.5000f,  40.00f},
-        {3508.0000f,  60.00f},
-        {3511.5000f,  80.00f},
-        {3514.2500f, 100.00f},
-        {3523.1250f, 130.45f},
-        {3525.6250f, 141.11f},
-    };
+    float resist;
+    const float raw_100r = 3522.3750f;
+    const float raw_154r = 3556.5000f;
 
     for(uint32_t i = 0U; i < 8U; i++){
         (void)GD30AD3344_AD_Read(GD30AD3344_Channel_4, GD30AD3344_PGA_0V064);
@@ -797,15 +783,8 @@ static float sys_temperature_value(void)
     }
 
     raw = (float)raw_sum / 8.0f;
-    if(raw <= cal[0].raw) return cal[0].temp;
-    for(uint32_t i = 1U; i < (sizeof(cal) / sizeof(cal[0])); i++){
-        if(raw <= cal[i].raw){
-            float span = cal[i].raw - cal[i - 1U].raw;
-            float ratio = (raw - cal[i - 1U].raw) / span;
-            return cal[i - 1U].temp + (cal[i].temp - cal[i - 1U].temp) * ratio;
-        }
-    }
-    return cal[(sizeof(cal) / sizeof(cal[0])) - 1U].temp;
+    resist = 100.0f + (raw - raw_100r) * (154.0f - 100.0f) / (raw_154r - raw_100r);
+    return pt100_r_to_temp(resist);
 }
 
 static void sys_dac_apply(uint16_t value)
