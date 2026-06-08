@@ -9,6 +9,7 @@
 #include "rtc_app.h"
 #include "adc_app.h"
 #include "gd30ad3344.h"
+#include "pt100.h"
 #include "bl_partition.h"
 
 extern uint8_t rxbuffer[OTA_UART_RXBUF_SIZE];
@@ -380,18 +381,6 @@ static bool config_write(const config_data_t *cfg)
 
     fmc_lock();
     return true;
-}
-
-/* 恢复出厂配置：ID=0x0001, 波特率=19200(code 0x11), 其余默认。
- * 供按键长按调用，写Flash持久化后需重启或重设串口波特率生效。
- * 返回true成功。 */
-uint8_t config_restore_factory(void)
-{
-    config_data_t cfg;
-    config_default(&cfg);
-    cfg.device_id = DEVICE_ID_DEFAULT;   /* 0x0001 */
-    cfg.baud_code = 0x11U;               /* 强制19200(当前映射表0x11=19200) */
-    return config_write(&cfg) ? 1U : 0U;
 }
 
 /* 解析INI文件中的值 */
@@ -781,7 +770,42 @@ static float sys_ch1_voltage(void)
 
 static float sys_temperature_value(void)
 {
-    return GD30AD3344_AD_Read(GD30AD3344_Channel_4, GD30AD3344_PGA_4V096);
+    int32_t raw_sum = 0;
+    float raw;
+    static const struct {
+        float raw;
+        float temp;
+    } cal[] = {
+        {3478.0000f, -49.27f},
+        {3481.0000f, -44.49f},
+        {3490.1250f,   0.00f},
+        {3497.8750f,  20.00f},
+        {3500.7500f,  33.44f},
+        {3502.3750f,  38.61f},
+        {3502.5000f,  40.00f},
+        {3508.0000f,  60.00f},
+        {3511.5000f,  80.00f},
+        {3514.2500f, 100.00f},
+        {3523.1250f, 130.45f},
+        {3525.6250f, 141.11f},
+    };
+
+    for(uint32_t i = 0U; i < 8U; i++){
+        (void)GD30AD3344_AD_Read(GD30AD3344_Channel_4, GD30AD3344_PGA_0V064);
+        raw_sum += g_gd30ad3344_last_raw;
+        delay_ms(20);
+    }
+
+    raw = (float)raw_sum / 8.0f;
+    if(raw <= cal[0].raw) return cal[0].temp;
+    for(uint32_t i = 1U; i < (sizeof(cal) / sizeof(cal[0])); i++){
+        if(raw <= cal[i].raw){
+            float span = cal[i].raw - cal[i - 1U].raw;
+            float ratio = (raw - cal[i - 1U].raw) / span;
+            return cal[i - 1U].temp + (cal[i].temp - cal[i - 1U].temp) * ratio;
+        }
+    }
+    return cal[(sizeof(cal) / sizeof(cal[0])) - 1U].temp;
 }
 
 static void sys_dac_apply(uint16_t value)

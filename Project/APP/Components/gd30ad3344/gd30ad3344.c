@@ -225,6 +225,7 @@ void spi_gd30ad3344_wait_for_dma_end(void)
 
 
 GD30AD3344 GD30AD3344_InitStruct;
+int16_t g_gd30ad3344_last_raw = 0;
 
 void GD30AD3344_Init(void)
 {
@@ -270,8 +271,11 @@ float ADS118_PGA_SET(GD30AD3344_PGA_TypeDef PGA)
         PGA_DATA = 0.512;
 
 
-    if(PGA == GD30AD3344_PGA_0V512)
+    if(PGA == GD30AD3344_PGA_0V256)
         PGA_DATA = 0.256;
+
+    if(PGA == GD30AD3344_PGA_0V064)
+        PGA_DATA = 0.064;
 
     return (float)PGA_DATA;
 
@@ -281,19 +285,23 @@ float ADS118_PGA_SET(GD30AD3344_PGA_TypeDef PGA)
 float GD30AD3344_AD_Read(GD30AD3344_Channel_TypeDef CH,GD30AD3344_PGA_TypeDef Ref)          
 {
     uint16_t raw_data;
+    int16_t signed_data;
     float result = 0.0;
     GD30AD3344_InitStruct.MUX     =	CH; // 0(默认)      1         2         3         4         5         6         7
     //AIN0~AIN1   AIN0~AIN3   AIN1~AIN3 AIN2~AIN3 AIN0~GND  AIN1~GND  AIN2~GND  AIN3~GND 
     GD30AD3344_InitStruct.PGA     =	Ref; //    0         1       2(默认)     3         4         5         6         7
     // ±6.144V   ±4.096V   ±2.048V   ±1.024V   ±0.512V   ±0.256V   ±0.256V  ±0.256V
+    GD30AD3344_InitStruct.DR      = 4;
+    GD30AD3344_InitStruct.RESERVED_1 = 0;
     
     
     raw_data = spi_gd30ad3344_send_halfword_dma(GD30AD3344_InitStruct_Value);
+    signed_data = (int16_t)raw_data;
+    g_gd30ad3344_last_raw = signed_data;
     
 //    elog_i("drv", "config : %d",  GD30AD3344_InitStruct_Value);
 //    my_printf(DEBUG_USART, "%d\r\n", raw_data);
-//    if(raw_data & 0x8000) raw_data = (~raw_data) + 1;
-    result = (float)raw_data * ADS118_PGA_SET(Ref) / 32768;
+    result = (float)signed_data * ADS118_PGA_SET(Ref) / 32768;
     return (float)result;
 }
 
@@ -356,4 +364,3 @@ float GD30AD3344_AD_Read(GD30AD3344_Channel_TypeDef CH,GD30AD3344_PGA_TypeDef Re
 ////  printf("max=%f,min=%f\r\n",Max,Min);
 //  return (float)(((num-Max-Min)/(len-2))-offset_b);                              //减去一个浮空的误差
 //} 
-

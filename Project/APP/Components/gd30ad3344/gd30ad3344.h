@@ -38,6 +38,7 @@ typedef struct _GD30AD3344
 }GD30AD3344;
 
 extern GD30AD3344 GD30AD3344_InitStruct;
+extern int16_t g_gd30ad3344_last_raw;
  
 
 typedef enum
